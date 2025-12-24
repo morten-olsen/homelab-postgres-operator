@@ -81,11 +81,18 @@ var _ = Describe("PostgresCluster Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Checking if the StatefulSet was created")
+			var statefulSet *appsv1.StatefulSet
 			Eventually(func() bool {
-				statefulSet := &appsv1.StatefulSet{}
+				statefulSet = &appsv1.StatefulSet{}
 				err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-statefulset", Namespace: "default"}, statefulSet)
 				return err == nil
 			}, time.Second*10, time.Millisecond*250).Should(BeTrue())
+
+			By("Updating StatefulSet status to have ready replicas")
+			replicas := int32(1)
+			statefulSet.Status.ReadyReplicas = replicas
+			statefulSet.Status.Replicas = replicas
+			Expect(k8sClient.Status().Update(ctx, statefulSet)).To(Succeed())
 
 			By("Checking if the Service was created")
 			Eventually(func() bool {
@@ -105,6 +112,12 @@ var _ = Describe("PostgresCluster Controller", func() {
 				_, ok := secret.Data["password"]
 				return ok
 			}, time.Second*10, time.Millisecond*250).Should(BeTrue())
+
+			By("Reconciling again to update status with ready StatefulSet")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
 
 			By("Checking if the PostgresCluster status was updated")
 			Eventually(func() bool {

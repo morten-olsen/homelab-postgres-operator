@@ -103,8 +103,23 @@ var _ = Describe("PostgresDatabase Controller", func() {
 				return err == nil
 			}, time.Second*10, time.Millisecond*250).Should(BeTrue())
 
+			By("Updating PostgresCluster status to Ready")
+			cluster := &postgresv1.PostgresCluster{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: "default"}, cluster)).To(Succeed())
+			cluster.Status.Conditions = []metav1.Condition{
+				{
+					Type:               "Ready",
+					Status:             metav1.ConditionTrue,
+					Reason:             "Ready",
+					Message:            "PostgresCluster is ready",
+					LastTransitionTime: metav1.Now(),
+					ObservedGeneration: cluster.Generation,
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, cluster)).To(Succeed())
+
 			By("Reconciling the created PostgresDatabase resource with a mock database")
-			db, mock, err := sqlmock.New()
+			db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 			Expect(err).NotTo(HaveOccurred())
 			defer func() {
 				if closeErr := db.Close(); closeErr != nil {
@@ -115,9 +130,9 @@ var _ = Describe("PostgresDatabase Controller", func() {
 			// Database name and username will be computed as {namespace}_{name} = "default_test-database"
 			expectedDBName := "default_test-database"
 			expectedUserName := "default_test-database"
-			mock.ExpectExec(fmt.Sprintf("CREATE DATABASE \"%s\";", expectedDBName)).WillReturnResult(sqlmock.NewResult(1, 1))
-			mock.ExpectExec(fmt.Sprintf("CREATE USER \"%s\" WITH PASSWORD '.+';", expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
-			mock.ExpectExec(fmt.Sprintf("GRANT ALL PRIVILEGES ON DATABASE \"%s\" TO \"%s\";", expectedDBName, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(fmt.Sprintf(`CREATE DATABASE "%s";`, expectedDBName)).WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(fmt.Sprintf(`CREATE USER "%s" WITH PASSWORD '.+';`, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(fmt.Sprintf(`GRANT ALL PRIVILEGES ON DATABASE "%s" TO "%s";`, expectedDBName, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
 
 			databaseReconciler := &PostgresDatabaseReconciler{
 				Client: k8sClient,
