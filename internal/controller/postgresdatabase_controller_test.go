@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -106,7 +107,11 @@ var _ = Describe("PostgresDatabase Controller", func() {
 			By("Reconciling the created PostgresDatabase resource with a mock database")
 			db, mock, err := sqlmock.New()
 			Expect(err).NotTo(HaveOccurred())
-			defer db.Close()
+			defer func() {
+				if closeErr := db.Close(); closeErr != nil {
+					Fail(fmt.Sprintf("Failed to close database connection: %v", closeErr))
+				}
+			}()
 
 			mock.ExpectBegin()
 			mock.ExpectExec("CREATE DATABASE testdb;").WillReturnResult(sqlmock.NewResult(1, 1))

@@ -38,7 +38,10 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-const postgresDatabaseFinalizer = "postgresdatabase.finalizers.homelab.mortenolsen.pro"
+const (
+	postgresDatabaseFinalizer = "postgresdatabase.finalizers.homelab.mortenolsen.pro"
+	conditionReasonReady      = "Ready"
+)
 
 // quotePostgreSQLIdentifier quotes a PostgreSQL identifier to handle special characters.
 // It escapes any double quotes in the identifier and wraps it in double quotes.
@@ -95,11 +98,11 @@ type PostgresDatabaseReconciler struct {
 	DBConnectionFunc func(connStr string) (*sql.DB, error)
 }
 
-//+kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresdatabases,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresdatabases/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresdatabases/finalizers,verbs=update
-//+kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresclusters,verbs=get;list;watch
-//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresdatabases,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresdatabases/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresdatabases/finalizers,verbs=update
+// +kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresclusters,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -118,13 +121,90 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
-	// Fetch the PostgresCluster that this database belongs to
+	// Fetch and validate PostgresCluster
+	postgresCluster, clusterNamespace, result, err := r.fetchAndValidateCluster(ctx, postgresDatabase, log)
+	if result != nil {
+		return *result, err
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Get admin secret
+	adminSecret, result, err := r.fetchAdminSecret(ctx, postgresDatabase, postgresCluster, clusterNamespace, log)
+	if result != nil {
+		return *result, err
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	adminUser := "postgres" // Default admin user
+	adminPassword := string(adminSecret.Data["password"])
+	pgHost := fmt.Sprintf("%s-service", postgresCluster.Name)
+	pgPort := "5432"
+
+	// Handle deletion
+	if !postgresDatabase.DeletionTimestamp.IsZero() {
+		return r.handleDeletion(ctx, postgresDatabase, pgHost, pgPort, adminUser, adminPassword, log)
+	}
+
+	// Ensure finalizer
+	if err := r.ensureFinalizer(ctx, postgresDatabase); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Connect to database
+	db, result, err := r.connectToDatabase(ctx, postgresDatabase, pgHost, pgPort, adminUser, adminPassword, log)
+	if result != nil {
+		return *result, err
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			log.Error(closeErr, "Failed to close database connection")
+		}
+	}()
+
+	// Create/update connection secret
+	dbUserPassword, result, err := r.ensureConnectionSecret(ctx, postgresDatabase, pgHost, pgPort, log)
+	if result != nil {
+		return *result, err
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Create database and user
+	result, err = r.createDatabaseAndUser(ctx, postgresDatabase, db, dbUserPassword, log)
+	if result != nil {
+		return *result, err
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Update PostgresDatabase status
+	if err := r.updateStatus(ctx, postgresDatabase, pgHost, pgPort); err != nil {
+		log.Error(err, "Failed to update PostgresDatabase status")
+		return ctrl.Result{}, err
+	}
+
+	log.Info("PostgresDatabase status updated successfully", "PostgresDatabase.Name", postgresDatabase.Name)
+
+	return ctrl.Result{}, nil
+}
+
+// fetchAndValidateCluster fetches and validates the PostgresCluster.
+func (r *PostgresDatabaseReconciler) fetchAndValidateCluster(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, log logr.Logger) (*postgresv1.PostgresCluster, string, *ctrl.Result, error) {
 	clusterNamespace := postgresDatabase.Namespace
 	if postgresDatabase.Spec.ClusterRef.Namespace != "" {
 		clusterNamespace = postgresDatabase.Spec.ClusterRef.Namespace
 	}
 	postgresCluster := &postgresv1.PostgresCluster{}
-	err = r.Get(ctx, types.NamespacedName{Name: postgresDatabase.Spec.ClusterRef.Name, Namespace: clusterNamespace}, postgresCluster)
+	err := r.Get(ctx, types.NamespacedName{Name: postgresDatabase.Spec.ClusterRef.Name, Namespace: clusterNamespace}, postgresCluster)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			log.Info("PostgresCluster not found, requeueing", "PostgresCluster.Name", postgresDatabase.Spec.ClusterRef.Name, "PostgresCluster.Namespace", clusterNamespace)
@@ -133,7 +213,7 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 				log.Error(updateErr, "Failed to update status")
 			}
-			return ctrl.Result{Requeue: true}, nil // Requeue until cluster exists
+			return nil, "", &ctrl.Result{Requeue: true}, nil
 		}
 		log.Error(err, "Failed to get PostgresCluster")
 		r.setCondition(postgresDatabase, "ClusterReady", false, fmt.Sprintf("Failed to get PostgresCluster: %v", err))
@@ -141,7 +221,7 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 			log.Error(updateErr, "Failed to update status")
 		}
-		return ctrl.Result{}, err
+		return nil, "", nil, err
 	}
 
 	// Check if PostgresCluster is ready
@@ -152,13 +232,17 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 			log.Error(updateErr, "Failed to update status")
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return nil, "", &ctrl.Result{Requeue: true}, nil
 	}
 
-	// Get the admin secret for the PostgresCluster
+	return postgresCluster, clusterNamespace, nil, nil
+}
+
+// fetchAdminSecret fetches the admin secret for the PostgresCluster.
+func (r *PostgresDatabaseReconciler) fetchAdminSecret(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, postgresCluster *postgresv1.PostgresCluster, clusterNamespace string, log logr.Logger) (*corev1.Secret, *ctrl.Result, error) {
 	adminSecretName := fmt.Sprintf("%s-admin-secret", postgresCluster.Name)
 	adminSecret := &corev1.Secret{}
-	err = r.Get(ctx, types.NamespacedName{Name: adminSecretName, Namespace: clusterNamespace}, adminSecret)
+	err := r.Get(ctx, types.NamespacedName{Name: adminSecretName, Namespace: clusterNamespace}, adminSecret)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			log.Info("Admin secret for PostgresCluster not found, requeueing", "Secret.Name", adminSecretName)
@@ -167,7 +251,7 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 				log.Error(updateErr, "Failed to update status")
 			}
-			return ctrl.Result{Requeue: true}, nil // Requeue until secret exists
+			return nil, &ctrl.Result{Requeue: true}, nil
 		}
 		log.Error(err, "Failed to get admin secret for PostgresCluster")
 		r.setCondition(postgresDatabase, "SecretReady", false, fmt.Sprintf("Failed to get admin secret: %v", err))
@@ -175,56 +259,58 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 			log.Error(updateErr, "Failed to update status")
 		}
-		return ctrl.Result{}, err
+		return nil, nil, err
 	}
 	r.setCondition(postgresDatabase, "SecretReady", true, "Admin secret found")
+	return adminSecret, nil, nil
+}
 
-	adminUser := "postgres" // Default admin user
-	adminPassword := string(adminSecret.Data["password"])
-	pgHost := fmt.Sprintf("%s-service", postgresCluster.Name)
-	pgPort := "5432"
+// handleDeletion handles the deletion of a PostgresDatabase.
+func (r *PostgresDatabaseReconciler) handleDeletion(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, pgHost, pgPort, adminUser, adminPassword string, log logr.Logger) (ctrl.Result, error) {
+	if controllerutil.ContainsFinalizer(postgresDatabase, postgresDatabaseFinalizer) {
+		log.Info("Performing finalizer cleanup for PostgresDatabase", "PostgresDatabase.Name", postgresDatabase.Name)
 
-	// Examine if the object is being deleted
-	if !postgresDatabase.DeletionTimestamp.IsZero() {
-		if controllerutil.ContainsFinalizer(postgresDatabase, postgresDatabaseFinalizer) {
-			log.Info("Performing finalizer cleanup for PostgresDatabase", "PostgresDatabase.Name", postgresDatabase.Name)
-
-			if postgresDatabase.Spec.ReclaimPolicy == "Delete" {
-				psqlConn := fmt.Sprintf("host=%s port=%s user=%s password=%s sslmode=disable", pgHost, pgPort, adminUser, adminPassword)
-				db, err := r.DBConnectionFunc(psqlConn)
-				if err != nil {
-					log.Error(err, "Failed to open database connection during finalization")
-					return ctrl.Result{}, err
-				}
-				defer db.Close()
-
-				if err := dropDatabaseAndUser(ctx, postgresDatabase, db, log); err != nil {
-					log.Error(err, "Failed to drop database and user during finalization")
-					return ctrl.Result{}, err
-				}
+		if postgresDatabase.Spec.ReclaimPolicy == "Delete" {
+			psqlConn := fmt.Sprintf("host=%s port=%s user=%s password=%s sslmode=disable", pgHost, pgPort, adminUser, adminPassword)
+			db, err := r.DBConnectionFunc(psqlConn)
+			if err != nil {
+				log.Error(err, "Failed to open database connection during finalization")
+				return ctrl.Result{}, err
 			}
+			defer func() {
+				if closeErr := db.Close(); closeErr != nil {
+					log.Error(closeErr, "Failed to close database connection")
+				}
+			}()
 
-			// remove our finalizer from the list and update it.
-			controllerutil.RemoveFinalizer(postgresDatabase, postgresDatabaseFinalizer)
-			if err := r.Update(ctx, postgresDatabase); err != nil {
+			if err := dropDatabaseAndUser(ctx, postgresDatabase, db, log); err != nil {
+				log.Error(err, "Failed to drop database and user during finalization")
 				return ctrl.Result{}, err
 			}
 		}
 
-		// Stop reconciliation as the object is being deleted
-		return ctrl.Result{}, nil
-	}
-
-	// The object is not being deleted, so if it does not have our finalizer,
-	// then lets add it.
-	if !controllerutil.ContainsFinalizer(postgresDatabase, postgresDatabaseFinalizer) {
-		controllerutil.AddFinalizer(postgresDatabase, postgresDatabaseFinalizer)
+		// remove our finalizer from the list and update it.
+		controllerutil.RemoveFinalizer(postgresDatabase, postgresDatabaseFinalizer)
 		if err := r.Update(ctx, postgresDatabase); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 
-	// Construct connection string for admin
+	// Stop reconciliation as the object is being deleted
+	return ctrl.Result{}, nil
+}
+
+// ensureFinalizer ensures the finalizer is set on the PostgresDatabase.
+func (r *PostgresDatabaseReconciler) ensureFinalizer(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase) error {
+	if !controllerutil.ContainsFinalizer(postgresDatabase, postgresDatabaseFinalizer) {
+		controllerutil.AddFinalizer(postgresDatabase, postgresDatabaseFinalizer)
+		return r.Update(ctx, postgresDatabase)
+	}
+	return nil
+}
+
+// connectToDatabase connects to the PostgreSQL database.
+func (r *PostgresDatabaseReconciler) connectToDatabase(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, pgHost, pgPort, adminUser, adminPassword string, log logr.Logger) (*sql.DB, *ctrl.Result, error) {
 	psqlConn := fmt.Sprintf("host=%s port=%s user=%s password=%s sslmode=disable", pgHost, pgPort, adminUser, adminPassword)
 	db, err := r.DBConnectionFunc(psqlConn)
 	if err != nil {
@@ -235,9 +321,8 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 			log.Error(updateErr, "Failed to update status")
 		}
-		return ctrl.Result{}, err
+		return nil, &ctrl.Result{}, err
 	}
-	defer db.Close()
 
 	err = db.PingContext(ctx)
 	if err != nil {
@@ -248,21 +333,22 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 			log.Error(updateErr, "Failed to update status")
 		}
-		return ctrl.Result{Requeue: true}, err
+		return nil, &ctrl.Result{Requeue: true}, err
 	}
-	log.Info("Successfully connected to PostgresCluster", "PostgresCluster.Name", postgresCluster.Name)
+	log.Info("Successfully connected to PostgresCluster")
 	r.setCondition(postgresDatabase, "ConnectionReady", true, "Successfully connected to PostgreSQL")
+	return db, nil, nil
+}
 
-	// Create/Update connection secret for PostgresDatabase
+// ensureConnectionSecret ensures the connection secret exists.
+func (r *PostgresDatabaseReconciler) ensureConnectionSecret(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, pgHost, pgPort string, log logr.Logger) (string, *ctrl.Result, error) {
 	dbConnectionSecretName := fmt.Sprintf("%s-connection", postgresDatabase.Name)
 	dbConnectionSecret := &corev1.Secret{}
-	err = r.Get(ctx, types.NamespacedName{Name: dbConnectionSecretName, Namespace: postgresDatabase.Namespace}, dbConnectionSecret)
-	var dbUserPassword string
+	err := r.Get(ctx, types.NamespacedName{Name: dbConnectionSecretName, Namespace: postgresDatabase.Namespace}, dbConnectionSecret)
 	if err != nil && errors.IsNotFound(err) {
 		log.Info("Creating connection secret for PostgresDatabase", "Secret.Namespace", postgresDatabase.Namespace, "Secret.Name", dbConnectionSecretName)
 
-		var err error
-		dbUserPassword, err = generateRandomPassword(32)
+		dbUserPassword, err := generateRandomPassword(32)
 		if err != nil {
 			errMsg := fmt.Sprintf("Failed to generate random password: %v", err)
 			log.Error(err, "Failed to generate random password for database user")
@@ -271,7 +357,7 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 				log.Error(updateErr, "Failed to update status")
 			}
-			return ctrl.Result{}, err
+			return "", &ctrl.Result{}, err
 		}
 
 		dbConnectionSecret = &corev1.Secret{
@@ -297,7 +383,7 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 				log.Error(updateErr, "Failed to update status")
 			}
-			return ctrl.Result{}, err
+			return "", &ctrl.Result{}, err
 		}
 
 		if err := r.Create(ctx, dbConnectionSecret); err != nil {
@@ -308,10 +394,11 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 				log.Error(updateErr, "Failed to update status")
 			}
-			return ctrl.Result{}, err
+			return "", &ctrl.Result{}, err
 		}
 		log.Info("Database connection secret created successfully")
 		r.setCondition(postgresDatabase, "SecretReady", true, "Connection secret created")
+		return dbUserPassword, nil, nil
 	} else if err != nil {
 		errMsg := fmt.Sprintf("Failed to get connection secret: %v", err)
 		log.Error(err, "Failed to get database connection secret")
@@ -320,13 +407,16 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 			log.Error(updateErr, "Failed to update status")
 		}
-		return ctrl.Result{}, err
-	} else {
-		log.Info("Database connection secret already exists", "Secret.Namespace", postgresDatabase.Namespace, "Secret.Name", dbConnectionSecretName)
-		dbUserPassword = string(dbConnectionSecret.Data["password"])
-		r.setCondition(postgresDatabase, "SecretReady", true, "Connection secret exists")
+		return "", &ctrl.Result{}, err
 	}
+	log.Info("Database connection secret already exists", "Secret.Namespace", postgresDatabase.Namespace, "Secret.Name", dbConnectionSecretName)
+	dbUserPassword := string(dbConnectionSecret.Data["password"])
+	r.setCondition(postgresDatabase, "SecretReady", true, "Connection secret exists")
+	return dbUserPassword, nil, nil
+}
 
+// createDatabaseAndUser creates the database and user.
+func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, db *sql.DB, dbUserPassword string, log logr.Logger) (*ctrl.Result, error) {
 	// Create database (must be executed outside of a transaction)
 	quotedDBName := quotePostgreSQLIdentifier(postgresDatabase.Spec.DatabaseName)
 	createDBQuery := fmt.Sprintf("CREATE DATABASE %s;", quotedDBName)
@@ -339,14 +429,12 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 				log.Error(updateErr, "Failed to update status")
 			}
-			return ctrl.Result{}, err
+			return &ctrl.Result{}, err
 		}
 		log.Info("Database already exists", "database", postgresDatabase.Spec.DatabaseName)
 	}
 
 	// Create user and grant privileges
-	// Note: We execute these separately because if CREATE USER fails with "already exists",
-	// we need to handle it without aborting the transaction
 	quotedUserName := quotePostgreSQLIdentifier(postgresDatabase.Spec.UserName)
 	// Escape single quotes in password by doubling them
 	escapedPassword := strings.ReplaceAll(dbUserPassword, "'", "''")
@@ -362,7 +450,7 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 				log.Error(updateErr, "Failed to update status")
 			}
-			return ctrl.Result{}, err
+			return &ctrl.Result{}, err
 		}
 		log.Info("User already exists", "user", postgresDatabase.Spec.UserName)
 	}
@@ -378,24 +466,15 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 			log.Error(updateErr, "Failed to update status")
 		}
-		return ctrl.Result{}, err
+		return &ctrl.Result{}, err
 	}
 	log.Info("Database and user created successfully")
 	r.setCondition(postgresDatabase, "DatabaseReady", true, "Database and user created successfully")
-
-	// Update PostgresDatabase status
-	if err := r.updateStatus(ctx, postgresDatabase, pgHost, pgPort, dbUserPassword); err != nil {
-		log.Error(err, "Failed to update PostgresDatabase status")
-		return ctrl.Result{}, err
-	}
-
-	log.Info("PostgresDatabase status updated successfully", "PostgresDatabase.Name", postgresDatabase.Name)
-
-	return ctrl.Result{}, nil
+	return nil, nil
 }
 
 // updateStatus updates the PostgresDatabase status with conditions, phase, and connection info.
-func (r *PostgresDatabaseReconciler) updateStatus(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, pgHost, pgPort, dbUserPassword string) error {
+func (r *PostgresDatabaseReconciler) updateStatus(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, pgHost, pgPort string) error {
 	// Set observed generation
 	postgresDatabase.Status.ObservedGeneration = postgresDatabase.Generation
 
@@ -448,7 +527,7 @@ func (r *PostgresDatabaseReconciler) setCondition(postgresDatabase *postgresv1.P
 	reason := "NotReady"
 	if status {
 		conditionStatus = metav1.ConditionTrue
-		reason = "Ready"
+		reason = conditionReasonReady
 	}
 
 	now := metav1.NewTime(time.Now())

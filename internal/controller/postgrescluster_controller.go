@@ -112,9 +112,8 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		log.Error(err, "Failed to get admin secret")
 		return ctrl.Result{}, err
 	} else {
-		// Secret already exists, retrieve password
+		// Secret already exists
 		log.Info("Admin secret already exists", "Secret.Namespace", postgresCluster.Namespace, "Secret.Name", adminSecretName)
-		password = string(adminSecret.Data["password"])
 	}
 
 	// Define labels for the StatefulSet and Service
@@ -342,7 +341,7 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Update PostgresCluster status
-	if err := r.updateStatus(ctx, postgresCluster, statefulSetForStatus, serviceForStatus, password); err != nil {
+	if err := r.updateStatus(ctx, postgresCluster, statefulSetForStatus, serviceForStatus); err != nil {
 		log.Error(err, "Failed to update PostgresCluster status")
 		return ctrl.Result{}, err
 	}
@@ -354,13 +353,13 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 }
 
 // updateStatus updates the PostgresCluster status with conditions, phase, and connection info.
-func (r *PostgresClusterReconciler) updateStatus(ctx context.Context, postgresCluster *postgresv1.PostgresCluster, statefulSet *appsv1.StatefulSet, service *corev1.Service, password string) error {
+func (r *PostgresClusterReconciler) updateStatus(ctx context.Context, postgresCluster *postgresv1.PostgresCluster, statefulSet *appsv1.StatefulSet, service *corev1.Service) error {
 	// Set observed generation
 	postgresCluster.Status.ObservedGeneration = postgresCluster.Generation
 
 	// Check StatefulSet status
 	statefulSetReady := false
-	statefulSetMessage := "StatefulSet is not ready"
+	var statefulSetMessage string
 	if statefulSet != nil {
 		if statefulSet.Status.ReadyReplicas == *statefulSet.Spec.Replicas && *statefulSet.Spec.Replicas > 0 {
 			statefulSetReady = true
@@ -413,7 +412,7 @@ func (r *PostgresClusterReconciler) setCondition(postgresCluster *postgresv1.Pos
 	reason := "NotReady"
 	if status {
 		conditionStatus = metav1.ConditionTrue
-		reason = "Ready"
+		reason = conditionReasonReady
 	}
 
 	now := metav1.NewTime(time.Now())
