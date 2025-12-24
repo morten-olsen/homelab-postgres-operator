@@ -44,10 +44,47 @@ type PostgresClusterStatus struct {
 	// For Kubernetes API conventions, see:
 	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 
+	// observedGeneration is the most recent generation observed for this PostgresCluster.
+	// It corresponds to the PostgresCluster's generation, which is updated on mutation by the API server.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// conditions represent the latest available observations of the PostgresCluster's state.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// phase represents the current phase of the PostgresCluster.
+	// +optional
+	Phase PostgresClusterPhase `json:"phase,omitempty"`
+
 	// adminConnection contains the connection details for the admin user.
+	// Note: Password is not included in status for security reasons.
 	// +optional
 	AdminConnection *PostgresClusterAdminConnection `json:"adminConnection,omitempty"`
 }
+
+// PostgresClusterPhase represents the phase of a PostgresCluster.
+// +kubebuilder:validation:Enum=Pending;Creating;Ready;Failed;Deleting
+type PostgresClusterPhase string
+
+const (
+	// PostgresClusterPhasePending indicates that the PostgresCluster is pending creation.
+	PostgresClusterPhasePending PostgresClusterPhase = "Pending"
+
+	// PostgresClusterPhaseCreating indicates that the PostgresCluster is being created.
+	PostgresClusterPhaseCreating PostgresClusterPhase = "Creating"
+
+	// PostgresClusterPhaseReady indicates that the PostgresCluster is ready and operational.
+	PostgresClusterPhaseReady PostgresClusterPhase = "Ready"
+
+	// PostgresClusterPhaseFailed indicates that the PostgresCluster has failed.
+	PostgresClusterPhaseFailed PostgresClusterPhase = "Failed"
+
+	// PostgresClusterPhaseDeleting indicates that the PostgresCluster is being deleted.
+	PostgresClusterPhaseDeleting PostgresClusterPhase = "Deleting"
+)
 
 // PostgresClusterAdminConnection defines the connection details for the admin user.
 type PostgresClusterAdminConnection struct {
@@ -60,10 +97,7 @@ type PostgresClusterAdminConnection struct {
 	// user is the username for the admin user.
 	User string `json:"user"`
 
-	// password is the password for the admin user.
-	Password string `json:"password"`
-
-	// url is the connection url for the admin user.
+	// url is the connection url for the admin user (without password for security).
 	URL string `json:"url"`
 }
 

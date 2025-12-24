@@ -308,12 +308,36 @@ spec: {}
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("waiting for the PostgresCluster StatefulSet to be ready")
+			By("waiting for the PostgresCluster to be Ready")
 			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "statefulset", fmt.Sprintf("%s-statefulset", clusterName), "-n", namespace, "-o", "jsonpath={.status.readyReplicas}")
+				cmd := exec.Command("kubectl", "get", "postgrescluster", clusterName, "-n", namespace, "-o", "json")
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("1"))
+
+				var cluster struct {
+					Status struct {
+						Phase      string `json:"phase"`
+						Conditions []struct {
+							Type    string `json:"type"`
+							Status  string `json:"status"`
+							Message string `json:"message"`
+						} `json:"conditions"`
+					} `json:"status"`
+				}
+				err = json.Unmarshal([]byte(output), &cluster)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(cluster.Status.Phase).To(Equal("Ready"), "PostgresCluster should be in Ready phase")
+
+				// Check Ready condition
+				readyFound := false
+				for _, condition := range cluster.Status.Conditions {
+					if condition.Type == "Ready" {
+						readyFound = true
+						g.Expect(condition.Status).To(Equal("True"), fmt.Sprintf("Ready condition should be True, but got: %s", condition.Message))
+						break
+					}
+				}
+				g.Expect(readyFound).To(BeTrue(), "Ready condition should exist")
 			}, "5m", "5s").Should(Succeed())
 
 			By("creating a PostgresDatabase resource")
@@ -334,7 +358,81 @@ spec:
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("waiting for the PostgresDatabase connection secret to be created")
+			By("waiting for the PostgresDatabase to be Ready")
+			var dbStatus struct {
+				Phase      string `json:"phase"`
+				Conditions []struct {
+					Type    string `json:"type"`
+					Status  string `json:"status"`
+					Message string `json:"message"`
+				} `json:"conditions"`
+				Connection struct {
+					Host     string `json:"host"`
+					Port     int    `json:"port"`
+					Database string `json:"database"`
+					User     string `json:"user"`
+					URL      string `json:"url"`
+				} `json:"connection"`
+			}
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "postgresdatabase", dbResourceName, "-n", namespace, "-o", "json")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+
+				var db struct {
+					Status struct {
+						Phase      string `json:"phase"`
+						Conditions []struct {
+							Type    string `json:"type"`
+							Status  string `json:"status"`
+							Message string `json:"message"`
+						} `json:"conditions"`
+						Connection struct {
+							Host     string `json:"host"`
+							Port     int    `json:"port"`
+							Database string `json:"database"`
+							User     string `json:"user"`
+							URL      string `json:"url"`
+						} `json:"connection"`
+					} `json:"status"`
+				}
+				err = json.Unmarshal([]byte(output), &db)
+				g.Expect(err).NotTo(HaveOccurred())
+
+				// Check phase
+				g.Expect(db.Status.Phase).To(Equal("Ready"), "PostgresDatabase should be in Ready phase")
+
+				// Check Ready condition
+				readyFound := false
+				var readyMessage string
+				for _, condition := range db.Status.Conditions {
+					if condition.Type == "Ready" {
+						readyFound = true
+						g.Expect(condition.Status).To(Equal("True"), fmt.Sprintf("Ready condition should be True, but got: %s", condition.Message))
+						readyMessage = condition.Message
+						break
+					}
+				}
+				g.Expect(readyFound).To(BeTrue(), "Ready condition should exist")
+				g.Expect(readyMessage).To(Equal("PostgresDatabase is ready"), "Ready condition message should indicate readiness")
+
+				// Check for any failed conditions
+				for _, condition := range db.Status.Conditions {
+					if condition.Status == "False" && condition.Type != "Ready" {
+						g.Expect(condition.Status).To(Equal("True"), fmt.Sprintf("Condition %s should not be False: %s", condition.Type, condition.Message))
+					}
+				}
+
+				// Verify connection info is set
+				g.Expect(db.Status.Connection.Host).NotTo(BeEmpty(), "Connection host should be set")
+				g.Expect(db.Status.Connection.Database).To(Equal(dbName), "Connection database should match")
+				g.Expect(db.Status.Connection.User).To(Equal(userName), "Connection user should match")
+				g.Expect(db.Status.Connection.Port).To(Equal(5432), "Connection port should be 5432")
+
+				dbStatus = db.Status
+			}, "5m", "5s").Should(Succeed())
+
+			By("verifying the connection secret was created")
 			var secretData map[string][]byte
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "secret", fmt.Sprintf("%s-connection", dbResourceName), "-n", namespace, "-o", "json")
@@ -353,13 +451,13 @@ spec:
 				g.Expect(secret.Data).Should(HaveKey("password"))
 				g.Expect(secret.Data).Should(HaveKey("url"))
 				secretData = secret.Data
-			}, "2m", "5s").Should(Succeed())
+			}, "1m", "2s").Should(Succeed())
 
-			By("verifying the database and user were created")
-			// We need to port-forward to the service to connect to the database.
-			// This is complex to do in the test, so for now we will just check the secret data.
+			By("verifying the database and user were created correctly")
 			Expect(string(secretData["database"])).To(Equal(dbName))
 			Expect(string(secretData["user"])).To(Equal(userName))
+			Expect(dbStatus.Connection.Database).To(Equal(dbName))
+			Expect(dbStatus.Connection.User).To(Equal(userName))
 		})
 	})
 })

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt" // Import fmt for string formatting
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1" // Import for appsv1.StatefulSet
 	corev1 "k8s.io/api/core/v1" // Import for corev1.Secret
@@ -319,15 +320,29 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		// TODO: Implement update logic here if needed
 	}
 
-	// Update PostgresCluster status
-	postgresCluster.Status.AdminConnection = &postgresv1.PostgresClusterAdminConnection{
-		Host:     fmt.Sprintf("%s-service", postgresCluster.Name), // Assuming a service will be named this
-		Port:     5432,                                            // Default PostgreSQL port
-		User:     "postgres",                                      // Default admin user
-		Password: password,
-		URL:      fmt.Sprintf("postgresql://postgres:%s@%s-service:5432/postgres", password, postgresCluster.Name),
+	// Refetch StatefulSet to get latest status before updating PostgresCluster status
+	statefulSetForStatus := &appsv1.StatefulSet{}
+	err = r.Get(ctx, types.NamespacedName{Name: statefulSetName, Namespace: postgresCluster.Namespace}, statefulSetForStatus)
+	if err != nil && !errors.IsNotFound(err) {
+		log.Error(err, "Failed to get StatefulSet for status update")
+		// Continue with nil StatefulSet for status update
+		statefulSetForStatus = nil
+	} else if errors.IsNotFound(err) {
+		statefulSetForStatus = nil
 	}
-	if err := r.Status().Update(ctx, postgresCluster); err != nil {
+
+	// Refetch Service to get latest status
+	serviceForStatus := &corev1.Service{}
+	err = r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: postgresCluster.Namespace}, serviceForStatus)
+	if err != nil && !errors.IsNotFound(err) {
+		log.Error(err, "Failed to get Service for status update")
+		serviceForStatus = nil
+	} else if errors.IsNotFound(err) {
+		serviceForStatus = nil
+	}
+
+	// Update PostgresCluster status
+	if err := r.updateStatus(ctx, postgresCluster, statefulSetForStatus, serviceForStatus, password); err != nil {
 		log.Error(err, "Failed to update PostgresCluster status")
 		return ctrl.Result{}, err
 	}
@@ -336,6 +351,144 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	return ctrl.Result{}, nil
 
+}
+
+// updateStatus updates the PostgresCluster status with conditions, phase, and connection info.
+func (r *PostgresClusterReconciler) updateStatus(ctx context.Context, postgresCluster *postgresv1.PostgresCluster, statefulSet *appsv1.StatefulSet, service *corev1.Service, password string) error {
+	// Set observed generation
+	postgresCluster.Status.ObservedGeneration = postgresCluster.Generation
+
+	// Check StatefulSet status
+	statefulSetReady := false
+	statefulSetMessage := "StatefulSet is not ready"
+	if statefulSet != nil {
+		if statefulSet.Status.ReadyReplicas == *statefulSet.Spec.Replicas && *statefulSet.Spec.Replicas > 0 {
+			statefulSetReady = true
+			statefulSetMessage = "StatefulSet is ready"
+		} else {
+			statefulSetMessage = fmt.Sprintf("StatefulSet has %d/%d ready replicas", statefulSet.Status.ReadyReplicas, *statefulSet.Spec.Replicas)
+		}
+	} else {
+		statefulSetMessage = "StatefulSet does not exist"
+	}
+
+	// Check Service status
+	serviceReady := service != nil
+	serviceMessage := "Service is ready"
+	if !serviceReady {
+		serviceMessage = "Service does not exist"
+	}
+
+	// Update conditions
+	r.setCondition(postgresCluster, "StatefulSetReady", statefulSetReady, statefulSetMessage)
+	r.setCondition(postgresCluster, "ServiceReady", serviceReady, serviceMessage)
+
+	// Determine overall Ready condition
+	overallReady := statefulSetReady && serviceReady
+	overallMessage := "PostgresCluster is ready"
+	if !overallReady {
+		overallMessage = fmt.Sprintf("StatefulSet ready: %v, Service ready: %v", statefulSetReady, serviceReady)
+	}
+	r.setCondition(postgresCluster, "Ready", overallReady, overallMessage)
+
+	// Update phase based on conditions
+	r.updatePhase(postgresCluster, statefulSet)
+
+	// Update admin connection (without password for security)
+	if overallReady {
+		postgresCluster.Status.AdminConnection = &postgresv1.PostgresClusterAdminConnection{
+			Host: fmt.Sprintf("%s-service", postgresCluster.Name),
+			Port: 5432,
+			User: "postgres",
+			URL:  fmt.Sprintf("postgresql://postgres@%s-service:5432/postgres", postgresCluster.Name),
+		}
+	}
+
+	return r.Status().Update(ctx, postgresCluster)
+}
+
+// setCondition sets or updates a condition on the PostgresCluster.
+func (r *PostgresClusterReconciler) setCondition(postgresCluster *postgresv1.PostgresCluster, conditionType string, status bool, message string) {
+	conditionStatus := metav1.ConditionFalse
+	reason := "NotReady"
+	if status {
+		conditionStatus = metav1.ConditionTrue
+		reason = "Ready"
+	}
+
+	now := metav1.NewTime(time.Now())
+	condition := metav1.Condition{
+		Type:               conditionType,
+		Status:             conditionStatus,
+		Reason:             reason,
+		Message:            message,
+		LastTransitionTime: now,
+		ObservedGeneration: postgresCluster.Generation,
+	}
+
+	// Find existing condition
+	for i, c := range postgresCluster.Status.Conditions {
+		if c.Type == conditionType {
+			// Only update if status or generation changed
+			if c.Status != conditionStatus || c.ObservedGeneration != postgresCluster.Generation {
+				postgresCluster.Status.Conditions[i] = condition
+			} else {
+				// Update message and time even if status hasn't changed
+				postgresCluster.Status.Conditions[i].Message = message
+				postgresCluster.Status.Conditions[i].LastTransitionTime = now
+			}
+			return
+		}
+	}
+
+	// Condition doesn't exist, add it
+	postgresCluster.Status.Conditions = append(postgresCluster.Status.Conditions, condition)
+}
+
+// updatePhase updates the phase based on the current conditions.
+func (r *PostgresClusterReconciler) updatePhase(postgresCluster *postgresv1.PostgresCluster, statefulSet *appsv1.StatefulSet) {
+	// Check if being deleted
+	if !postgresCluster.DeletionTimestamp.IsZero() {
+		postgresCluster.Status.Phase = postgresv1.PostgresClusterPhaseDeleting
+		return
+	}
+
+	// Check Ready condition
+	readyCondition := r.getCondition(postgresCluster, "Ready")
+	if readyCondition == nil {
+		postgresCluster.Status.Phase = postgresv1.PostgresClusterPhasePending
+		return
+	}
+
+	switch readyCondition.Status {
+	case metav1.ConditionTrue:
+		postgresCluster.Status.Phase = postgresv1.PostgresClusterPhaseReady
+	case metav1.ConditionFalse:
+		// Check if there's a failure condition
+		statefulSetCondition := r.getCondition(postgresCluster, "StatefulSetReady")
+		if statefulSetCondition != nil && statefulSetCondition.Status == metav1.ConditionFalse {
+			// Check if StatefulSet exists
+			if statefulSet == nil || statefulSetCondition.Message == "StatefulSet does not exist" {
+				postgresCluster.Status.Phase = postgresv1.PostgresClusterPhaseCreating
+			} else {
+				postgresCluster.Status.Phase = postgresv1.PostgresClusterPhaseFailed
+			}
+		} else {
+			postgresCluster.Status.Phase = postgresv1.PostgresClusterPhaseCreating
+		}
+	default:
+		postgresCluster.Status.Phase = postgresv1.PostgresClusterPhasePending
+	}
+}
+
+// getCondition returns the condition with the given type, or nil if not found.
+func (r *PostgresClusterReconciler) getCondition(postgresCluster *postgresv1.PostgresCluster, conditionType string) *metav1.Condition {
+	for i := range postgresCluster.Status.Conditions {
+		if postgresCluster.Status.Conditions[i].Type == conditionType {
+			return &postgresCluster.Status.Conditions[i]
+		}
+	}
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

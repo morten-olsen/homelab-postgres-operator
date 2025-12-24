@@ -73,10 +73,47 @@ type PostgresDatabaseStatus struct {
 	// For Kubernetes API conventions, see:
 	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 
+	// observedGeneration is the most recent generation observed for this PostgresDatabase.
+	// It corresponds to the PostgresDatabase's generation, which is updated on mutation by the API server.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// conditions represent the latest available observations of the PostgresDatabase's state.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// phase represents the current phase of the PostgresDatabase.
+	// +optional
+	Phase PostgresDatabasePhase `json:"phase,omitempty"`
+
 	// connection contains the connection details for the created database and user.
+	// Note: Password is not included in status for security reasons.
 	// +optional
 	Connection *PostgresDatabaseConnection `json:"connection,omitempty"`
 }
+
+// PostgresDatabasePhase represents the phase of a PostgresDatabase.
+// +kubebuilder:validation:Enum=Pending;Creating;Ready;Failed;Deleting
+type PostgresDatabasePhase string
+
+const (
+	// PostgresDatabasePhasePending indicates that the PostgresDatabase is pending creation.
+	PostgresDatabasePhasePending PostgresDatabasePhase = "Pending"
+
+	// PostgresDatabasePhaseCreating indicates that the PostgresDatabase is being created.
+	PostgresDatabasePhaseCreating PostgresDatabasePhase = "Creating"
+
+	// PostgresDatabasePhaseReady indicates that the PostgresDatabase is ready and operational.
+	PostgresDatabasePhaseReady PostgresDatabasePhase = "Ready"
+
+	// PostgresDatabasePhaseFailed indicates that the PostgresDatabase has failed.
+	PostgresDatabasePhaseFailed PostgresDatabasePhase = "Failed"
+
+	// PostgresDatabasePhaseDeleting indicates that the PostgresDatabase is being deleted.
+	PostgresDatabasePhaseDeleting PostgresDatabasePhase = "Deleting"
+)
 
 // PostgresDatabaseConnection defines the connection details for a specific database and user.
 type PostgresDatabaseConnection struct {
@@ -92,10 +129,7 @@ type PostgresDatabaseConnection struct {
 	// user is the username for the created user.
 	User string `json:"user"`
 
-	// password is the password for the created user.
-	Password string `json:"password"`
-
-	// url is the connection url for the created user and database.
+	// url is the connection url for the created user and database (without password for security).
 	URL string `json:"url"`
 }
 
