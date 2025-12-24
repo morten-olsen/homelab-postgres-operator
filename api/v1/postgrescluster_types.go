@@ -31,7 +31,7 @@ type PostgresClusterSpec struct {
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
 	// image is the container image to use for the cluster.
-	// +kubebuilder:default:="pgvector/pgvector:pg16"
+	// +kubebuilder:default:="pgvector/pgvector:pg18"
 	// +optional
 	Image string `json:"image,omitempty"`
 }

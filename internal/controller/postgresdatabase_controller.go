@@ -143,7 +143,7 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	pgPort := "5432"
 
 	// Examine if the object is being deleted
-	if !postgresDatabase.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !postgresDatabase.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(postgresDatabase, postgresDatabaseFinalizer) {
 			log.Info("Performing finalizer cleanup for PostgresDatabase", "PostgresDatabase.Name", postgresDatabase.Name)
 

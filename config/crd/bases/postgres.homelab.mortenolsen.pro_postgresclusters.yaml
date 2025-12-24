@@ -40,7 +40,7 @@ spec:
             description: spec defines the desired state of PostgresCluster
             properties:
               image:
-                default: pgvector/pgvector:pg16
+                default: pgvector/pgvector:pg18
                 description: image is the container image to use for the cluster.
                 type: string
             type: object

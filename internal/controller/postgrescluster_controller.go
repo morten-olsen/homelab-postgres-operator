@@ -44,6 +44,8 @@ type PostgresClusterReconciler struct {
 // +kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresclusters/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -145,10 +147,60 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 						Labels: labels,
 					},
 					Spec: corev1.PodSpec{
+						SecurityContext: &corev1.PodSecurityContext{
+							RunAsNonRoot: func(b bool) *bool { return &b }(true),
+							RunAsUser:    func(i int64) *int64 { return &i }(999), // Set at pod level to ensure volume ownership
+							FSGroup:      func(i int64) *int64 { return &i }(999), // Ensure volumes are owned by GID 999
+							SeccompProfile: &corev1.SeccompProfile{
+								Type: corev1.SeccompProfileTypeRuntimeDefault,
+							},
+						},
+						InitContainers: []corev1.Container{
+							{
+								Name:  "init-data-dir",
+								Image: "busybox:1.36",
+								SecurityContext: &corev1.SecurityContext{
+									AllowPrivilegeEscalation: func(b bool) *bool { return &b }(false),
+									Capabilities: &corev1.Capabilities{
+										Drop: []corev1.Capability{"ALL"},
+									},
+									RunAsNonRoot: func(b bool) *bool { return &b }(true),
+									SeccompProfile: &corev1.SeccompProfile{
+										Type: corev1.SeccompProfileTypeRuntimeDefault,
+									},
+								},
+								Command: []string{"sh", "-c", `
+									# Ensure the PostgreSQL directory exists (PostgreSQL 18+ will create version-specific subdirectory)
+									# If directory doesn't exist, create it (will be owned by 999:999 due to RunAsUser and FSGroup)
+									if [ ! -d /var/lib/postgresql ]; then
+										mkdir -p /var/lib/postgresql
+									fi
+									# Ensure we can write to it (should already be writable due to fsGroup)
+									touch /var/lib/postgresql/.init-ready 2>/dev/null || true
+									rm -f /var/lib/postgresql/.init-ready 2>/dev/null || true
+								`},
+								VolumeMounts: []corev1.VolumeMount{
+									{
+										Name:      "data",
+										MountPath: "/var/lib/postgresql",
+									},
+								},
+							},
+						},
 						Containers: []corev1.Container{
 							{
 								Name:  "postgres",
 								Image: postgresCluster.Spec.Image,
+								SecurityContext: &corev1.SecurityContext{
+									AllowPrivilegeEscalation: func(b bool) *bool { return &b }(false),
+									Capabilities: &corev1.Capabilities{
+										Drop: []corev1.Capability{"ALL"},
+									},
+									RunAsNonRoot: func(b bool) *bool { return &b }(true),
+									SeccompProfile: &corev1.SeccompProfile{
+										Type: corev1.SeccompProfileTypeRuntimeDefault,
+									},
+								},
 								Ports: []corev1.ContainerPort{
 									{
 										ContainerPort: 5432,
@@ -179,7 +231,7 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 								VolumeMounts: []corev1.VolumeMount{
 									{
 										Name:      "data",
-										MountPath: "/var/lib/postgresql/data",
+										MountPath: "/var/lib/postgresql",
 									},
 								},
 							},

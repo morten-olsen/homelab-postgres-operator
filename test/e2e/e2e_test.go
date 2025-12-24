@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -68,6 +69,12 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
+		By("deleting old rbac resources")
+		cmd = exec.Command("kubectl", "delete", "clusterrole", "manager-role", "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+		cmd = exec.Command("kubectl", "delete", "clusterrolebinding", "manager-rolebinding", "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+
 		By("deploying the controller-manager")
 		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
 		_, err = utils.Run(cmd)
@@ -78,7 +85,11 @@ var _ = Describe("Manager", Ordered, func() {
 	// and deleting the namespace.
 	AfterAll(func() {
 		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
+		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+
+		By("cleaning up the metrics role binding")
+		cmd = exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
 		_, _ = utils.Run(cmd)
 
 		By("undeploying the controller-manager")
@@ -277,6 +288,79 @@ var _ = Describe("Manager", Ordered, func() {
 		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
 		//    strings.ToLower(<Kind>),
 		// ))
+		It("should create a PostgresCluster and a PostgresDatabase", func() {
+			By("creating a PostgresCluster resource")
+			const clusterName = "e2e-test-cluster"
+			const dbName = "e2e-test-db"
+			const userName = "e2e-test-user"
+			const dbResourceName = "e2e-test-database"
+
+			cluster := fmt.Sprintf(`
+apiVersion: postgres.homelab.mortenolsen.pro/v1
+kind: PostgresCluster
+metadata:
+  name: %s
+  namespace: %s
+spec: {}
+`, clusterName, namespace)
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(cluster)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for the PostgresCluster StatefulSet to be ready")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "statefulset", fmt.Sprintf("%s-statefulset", clusterName), "-n", namespace, "-o", "jsonpath={.status.readyReplicas}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("1"))
+			}, "5m", "5s").Should(Succeed())
+
+			By("creating a PostgresDatabase resource")
+			database := fmt.Sprintf(`
+apiVersion: postgres.homelab.mortenolsen.pro/v1
+kind: PostgresDatabase
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+  databaseName: %s
+  userName: %s
+`, dbResourceName, namespace, clusterName, dbName, userName)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(database)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for the PostgresDatabase connection secret to be created")
+			var secretData map[string][]byte
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "secret", fmt.Sprintf("%s-connection", dbResourceName), "-n", namespace, "-o", "json")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+
+				var secret struct {
+					Data map[string][]byte `json:"data"`
+				}
+				err = json.Unmarshal([]byte(output), &secret)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(secret.Data).Should(HaveKey("host"))
+				g.Expect(secret.Data).Should(HaveKey("port"))
+				g.Expect(secret.Data).Should(HaveKey("database"))
+				g.Expect(secret.Data).Should(HaveKey("user"))
+				g.Expect(secret.Data).Should(HaveKey("password"))
+				g.Expect(secret.Data).Should(HaveKey("url"))
+				secretData = secret.Data
+			}, "2m", "5s").Should(Succeed())
+
+			By("verifying the database and user were created")
+			// We need to port-forward to the service to connect to the database.
+			// This is complex to do in the test, so for now we will just check the secret data.
+			Expect(string(secretData["database"])).To(Equal(dbName))
+			Expect(string(secretData["user"])).To(Equal(userName))
+		})
 	})
 })
 
