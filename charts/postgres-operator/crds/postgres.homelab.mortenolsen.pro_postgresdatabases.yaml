@@ -1,0 +1,125 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: postgresdatabases.postgres.homelab.mortenolsen.pro
+spec:
+  group: postgres.homelab.mortenolsen.pro
+  names:
+    kind: PostgresDatabase
+    listKind: PostgresDatabaseList
+    plural: postgresdatabases
+    singular: postgresdatabase
+  scope: Namespaced
+  versions:
+  - name: v1
+    schema:
+      openAPIV3Schema:
+        description: PostgresDatabase is the Schema for the postgresdatabases API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of PostgresDatabase
+            properties:
+              clusterRef:
+                description: ClusterRef is a reference to the PostgresCluster that
+                  this database belongs to.
+                properties:
+                  name:
+                    description: Name of the PostgresCluster.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: Namespace of the PostgresCluster. If empty, defaults
+                      to the current namespace.
+                    type: string
+                required:
+                - name
+                type: object
+              databaseName:
+                description: DatabaseName is the name of the database to create.
+                maxLength: 63
+                minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
+              reclaimPolicy:
+                default: Retain
+                description: |-
+                  ReclaimPolicy defines what happens to the database and user when this resource is deleted.
+                  Can be "Retain" (default) or "Delete".
+                enum:
+                - Retain
+                - Delete
+                type: string
+              userName:
+                description: UserName is the name of the user (role) to create for
+                  this database.
+                maxLength: 63
+                minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
+            required:
+            - clusterRef
+            - databaseName
+            - userName
+            type: object
+          status:
+            description: status defines the observed state of PostgresDatabase
+            properties:
+              connection:
+                description: connection contains the connection details for the created
+                  database and user.
+                properties:
+                  database:
+                    description: database is the name of the created database.
+                    type: string
+                  host:
+                    description: host is the hostname of the postgres cluster.
+                    type: string
+                  password:
+                    description: password is the password for the created user.
+                    type: string
+                  port:
+                    description: port is the port of the postgres cluster.
+                    type: integer
+                  url:
+                    description: url is the connection url for the created user and
+                      database.
+                    type: string
+                  user:
+                    description: user is the username for the created user.
+                    type: string
+                required:
+                - database
+                - host
+                - password
+                - port
+                - url
+                - user
+                type: object
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

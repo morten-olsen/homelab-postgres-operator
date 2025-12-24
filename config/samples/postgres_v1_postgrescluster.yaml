@@ -1,0 +1,9 @@
+apiVersion: postgres.homelab.mortenolsen.pro/v1
+kind: PostgresCluster
+metadata:
+  labels:
+    app.kubernetes.io/name: postgres-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: postgrescluster-sample
+spec:
+  # TODO(user): Add fields here
