@@ -43,6 +43,24 @@ const (
 	conditionReasonReady      = "Ready"
 )
 
+// getDatabaseName returns the database name, using the format {namespace}_{name}.
+// If DatabaseName is specified in the spec, it's used for backward compatibility.
+func getDatabaseName(postgresDatabase *postgresv1.PostgresDatabase) string {
+	if postgresDatabase.Spec.DatabaseName != "" {
+		return postgresDatabase.Spec.DatabaseName
+	}
+	return fmt.Sprintf("%s_%s", postgresDatabase.Namespace, postgresDatabase.Name)
+}
+
+// getUserName returns the username, using the format {namespace}_{name}.
+// If UserName is specified in the spec, it's used for backward compatibility.
+func getUserName(postgresDatabase *postgresv1.PostgresDatabase) string {
+	if postgresDatabase.Spec.UserName != "" {
+		return postgresDatabase.Spec.UserName
+	}
+	return fmt.Sprintf("%s_%s", postgresDatabase.Namespace, postgresDatabase.Name)
+}
+
 // quotePostgreSQLIdentifier quotes a PostgreSQL identifier to handle special characters.
 // It escapes any double quotes in the identifier and wraps it in double quotes.
 func quotePostgreSQLIdentifier(identifier string) string {
@@ -60,15 +78,18 @@ func dropDatabaseAndUser(ctx context.Context, postgresDatabase *postgresv1.Postg
 	}
 	defer tx.Rollback() // nolint:errcheck
 
+	databaseName := getDatabaseName(postgresDatabase)
+	userName := getUserName(postgresDatabase)
+
 	// Drop database
-	dropDBQuery := fmt.Sprintf("DROP DATABASE IF EXISTS %s;", quotePostgreSQLIdentifier(postgresDatabase.Spec.DatabaseName))
+	dropDBQuery := fmt.Sprintf("DROP DATABASE IF EXISTS %s;", quotePostgreSQLIdentifier(databaseName))
 	log.Info("Dropping database", "query", dropDBQuery)
 	if _, err := tx.ExecContext(ctx, dropDBQuery); err != nil {
 		return fmt.Errorf("failed to drop database: %w", err)
 	}
 
 	// Drop user
-	dropUserQuery := fmt.Sprintf("DROP USER IF EXISTS %s;", quotePostgreSQLIdentifier(postgresDatabase.Spec.UserName))
+	dropUserQuery := fmt.Sprintf("DROP USER IF EXISTS %s;", quotePostgreSQLIdentifier(userName))
 	log.Info("Dropping user", "query", dropUserQuery)
 	if _, err := tx.ExecContext(ctx, dropUserQuery); err != nil {
 		return fmt.Errorf("failed to drop user: %w", err)
@@ -121,6 +142,12 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
+	// Handle deletion FIRST, before fetching dependencies
+	// This ensures deletion can proceed even if cluster/secret are being deleted during undeploy
+	if !postgresDatabase.DeletionTimestamp.IsZero() {
+		return r.handleDeletion(ctx, postgresDatabase, log)
+	}
+
 	// Fetch and validate PostgresCluster
 	postgresCluster, clusterNamespace, result, err := r.fetchAndValidateCluster(ctx, postgresDatabase, log)
 	if result != nil {
@@ -143,11 +170,6 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	adminPassword := string(adminSecret.Data["password"])
 	pgHost := fmt.Sprintf("%s-service", postgresCluster.Name)
 	pgPort := "5432"
-
-	// Handle deletion
-	if !postgresDatabase.DeletionTimestamp.IsZero() {
-		return r.handleDeletion(ctx, postgresDatabase, pgHost, pgPort, adminUser, adminPassword, log)
-	}
 
 	// Ensure finalizer
 	if err := r.ensureFinalizer(ctx, postgresDatabase); err != nil {
@@ -266,17 +288,46 @@ func (r *PostgresDatabaseReconciler) fetchAdminSecret(ctx context.Context, postg
 }
 
 // handleDeletion handles the deletion of a PostgresDatabase.
-func (r *PostgresDatabaseReconciler) handleDeletion(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, pgHost, pgPort, adminUser, adminPassword string, log logr.Logger) (ctrl.Result, error) {
-	if controllerutil.ContainsFinalizer(postgresDatabase, postgresDatabaseFinalizer) {
-		log.Info("Performing finalizer cleanup for PostgresDatabase", "PostgresDatabase.Name", postgresDatabase.Name)
+// This function is resilient to missing cluster/secret during undeploy scenarios.
+func (r *PostgresDatabaseReconciler) handleDeletion(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, log logr.Logger) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(postgresDatabase, postgresDatabaseFinalizer) {
+		// No finalizer, nothing to do
+		return ctrl.Result{}, nil
+	}
 
-		if postgresDatabase.Spec.ReclaimPolicy == "Delete" {
-			psqlConn := fmt.Sprintf("host=%s port=%s user=%s password=%s sslmode=disable", pgHost, pgPort, adminUser, adminPassword)
-			db, err := r.DBConnectionFunc(psqlConn)
-			if err != nil {
-				log.Error(err, "Failed to open database connection during finalization")
-				return ctrl.Result{}, err
-			}
+	log.Info("Performing finalizer cleanup for PostgresDatabase", "PostgresDatabase.Name", postgresDatabase.Name)
+
+	// Try to fetch cluster and secret for cleanup, but don't fail if they're missing
+	// This allows deletion to proceed even during undeploy when resources are being deleted
+	clusterNamespace := postgresDatabase.Namespace
+	if postgresDatabase.Spec.ClusterRef.Namespace != "" {
+		clusterNamespace = postgresDatabase.Spec.ClusterRef.Namespace
+	}
+
+	postgresCluster := &postgresv1.PostgresCluster{}
+	err := r.Get(ctx, types.NamespacedName{Name: postgresDatabase.Spec.ClusterRef.Name, Namespace: clusterNamespace}, postgresCluster)
+	clusterAvailable := err == nil
+
+	var adminSecret *corev1.Secret
+	if clusterAvailable {
+		adminSecretName := fmt.Sprintf("%s-admin-secret", postgresCluster.Name)
+		adminSecret = &corev1.Secret{}
+		err = r.Get(ctx, types.NamespacedName{Name: adminSecretName, Namespace: clusterNamespace}, adminSecret)
+		clusterAvailable = err == nil
+	}
+
+	// Only attempt cleanup if cluster and secret are available and ReclaimPolicy is Delete
+	if clusterAvailable && adminSecret != nil && postgresDatabase.Spec.ReclaimPolicy == "Delete" {
+		adminUser := "postgres"
+		adminPassword := string(adminSecret.Data["password"])
+		pgHost := fmt.Sprintf("%s-service", postgresCluster.Name)
+		pgPort := "5432"
+
+		psqlConn := fmt.Sprintf("host=%s port=%s user=%s password=%s sslmode=disable", pgHost, pgPort, adminUser, adminPassword)
+		db, err := r.DBConnectionFunc(psqlConn)
+		if err != nil {
+			log.Error(err, "Failed to open database connection during finalization, will still remove finalizer")
+		} else {
 			defer func() {
 				if closeErr := db.Close(); closeErr != nil {
 					log.Error(closeErr, "Failed to close database connection")
@@ -284,19 +335,50 @@ func (r *PostgresDatabaseReconciler) handleDeletion(ctx context.Context, postgre
 			}()
 
 			if err := dropDatabaseAndUser(ctx, postgresDatabase, db, log); err != nil {
-				log.Error(err, "Failed to drop database and user during finalization")
-				return ctrl.Result{}, err
+				log.Error(err, "Failed to drop database and user during finalization, will still remove finalizer")
+			} else {
+				log.Info("Successfully dropped database and user during finalization")
 			}
 		}
-
-		// remove our finalizer from the list and update it.
-		controllerutil.RemoveFinalizer(postgresDatabase, postgresDatabaseFinalizer)
-		if err := r.Update(ctx, postgresDatabase); err != nil {
-			return ctrl.Result{}, err
+	} else {
+		if postgresDatabase.Spec.ReclaimPolicy == "Delete" {
+			log.Info("Cluster or secret not available during finalization, skipping database cleanup", "clusterAvailable", clusterAvailable)
 		}
 	}
 
-	// Stop reconciliation as the object is being deleted
+	// Always remove the finalizer, even if cleanup failed or wasn't possible
+	// This ensures the resource can be deleted even if dependencies are gone
+	// Re-fetch the resource to get the latest version and avoid conflicts
+	latestPostgresDatabase := &postgresv1.PostgresDatabase{}
+	if err := r.Get(ctx, types.NamespacedName{Name: postgresDatabase.Name, Namespace: postgresDatabase.Namespace}, latestPostgresDatabase); err != nil {
+		if errors.IsNotFound(err) {
+			// Resource already deleted, nothing to do
+			log.Info("PostgresDatabase already deleted")
+			return ctrl.Result{}, nil
+		}
+		log.Error(err, "Failed to re-fetch PostgresDatabase before removing finalizer")
+		return ctrl.Result{}, err
+	}
+
+	// Check if finalizer still exists (might have been removed by another process)
+	if !controllerutil.ContainsFinalizer(latestPostgresDatabase, postgresDatabaseFinalizer) {
+		log.Info("Finalizer already removed")
+		return ctrl.Result{}, nil
+	}
+
+	// Remove the finalizer
+	controllerutil.RemoveFinalizer(latestPostgresDatabase, postgresDatabaseFinalizer)
+	if err := r.Update(ctx, latestPostgresDatabase); err != nil {
+		if errors.IsConflict(err) {
+			// Conflict means resource was updated, requeue to retry
+			log.Info("Conflict updating PostgresDatabase to remove finalizer, will requeue")
+			return ctrl.Result{Requeue: true}, nil
+		}
+		log.Error(err, "Failed to remove finalizer")
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Finalizer removed successfully")
 	return ctrl.Result{}, nil
 }
 
@@ -360,6 +442,8 @@ func (r *PostgresDatabaseReconciler) ensureConnectionSecret(ctx context.Context,
 			return "", &ctrl.Result{}, err
 		}
 
+		databaseName := getDatabaseName(postgresDatabase)
+		userName := getUserName(postgresDatabase)
 		dbConnectionSecret = &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      dbConnectionSecretName,
@@ -368,10 +452,10 @@ func (r *PostgresDatabaseReconciler) ensureConnectionSecret(ctx context.Context,
 			Data: map[string][]byte{
 				"host":     []byte(pgHost),
 				"port":     []byte(pgPort),
-				"database": []byte(postgresDatabase.Spec.DatabaseName),
-				"user":     []byte(postgresDatabase.Spec.UserName),
+				"database": []byte(databaseName),
+				"user":     []byte(userName),
 				"password": []byte(dbUserPassword),
-				"url":      []byte(fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=disable", postgresDatabase.Spec.UserName, dbUserPassword, pgHost, pgPort, postgresDatabase.Spec.DatabaseName)),
+				"url":      []byte(fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=disable", userName, dbUserPassword, pgHost, pgPort, databaseName)),
 			},
 		}
 
@@ -417,8 +501,11 @@ func (r *PostgresDatabaseReconciler) ensureConnectionSecret(ctx context.Context,
 
 // createDatabaseAndUser creates the database and user.
 func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, db *sql.DB, dbUserPassword string, log logr.Logger) (*ctrl.Result, error) {
+	databaseName := getDatabaseName(postgresDatabase)
+	userName := getUserName(postgresDatabase)
+
 	// Create database (must be executed outside of a transaction)
-	quotedDBName := quotePostgreSQLIdentifier(postgresDatabase.Spec.DatabaseName)
+	quotedDBName := quotePostgreSQLIdentifier(databaseName)
 	createDBQuery := fmt.Sprintf("CREATE DATABASE %s;", quotedDBName)
 	if _, err := db.ExecContext(ctx, createDBQuery); err != nil {
 		if !strings.Contains(err.Error(), "already exists") {
@@ -431,11 +518,11 @@ func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, 
 			}
 			return &ctrl.Result{}, err
 		}
-		log.Info("Database already exists", "database", postgresDatabase.Spec.DatabaseName)
+		log.Info("Database already exists", "database", databaseName)
 	}
 
 	// Create user and grant privileges
-	quotedUserName := quotePostgreSQLIdentifier(postgresDatabase.Spec.UserName)
+	quotedUserName := quotePostgreSQLIdentifier(userName)
 	// Escape single quotes in password by doubling them
 	escapedPassword := strings.ReplaceAll(dbUserPassword, "'", "''")
 
@@ -452,7 +539,7 @@ func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, 
 			}
 			return &ctrl.Result{}, err
 		}
-		log.Info("User already exists", "user", postgresDatabase.Spec.UserName)
+		log.Info("User already exists", "user", userName)
 	}
 
 	// Grant privileges (can be done in a transaction, but we'll do it directly for simplicity)
@@ -509,12 +596,14 @@ func (r *PostgresDatabaseReconciler) updateStatus(ctx context.Context, postgresD
 
 	// Update connection info (without password for security)
 	if overallReady {
+		databaseName := getDatabaseName(postgresDatabase)
+		userName := getUserName(postgresDatabase)
 		postgresDatabase.Status.Connection = &postgresv1.PostgresDatabaseConnection{
 			Host:     pgHost,
 			Port:     5432,
-			Database: postgresDatabase.Spec.DatabaseName,
-			User:     postgresDatabase.Spec.UserName,
-			URL:      fmt.Sprintf("postgresql://%s@%s:%s/%s?sslmode=disable", postgresDatabase.Spec.UserName, pgHost, pgPort, postgresDatabase.Spec.DatabaseName),
+			Database: databaseName,
+			User:     userName,
+			URL:      fmt.Sprintf("postgresql://%s@%s:%s/%s?sslmode=disable", userName, pgHost, pgPort, databaseName),
 		}
 	}
 

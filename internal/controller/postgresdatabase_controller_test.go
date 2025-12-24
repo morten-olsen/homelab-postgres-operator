@@ -65,8 +65,7 @@ var _ = Describe("PostgresDatabase Controller", func() {
 					ClusterRef: postgresv1.ClusterReference{
 						Name: clusterName,
 					},
-					DatabaseName: "testdb",
-					UserName:     "testuser",
+					// DatabaseName and UserName are optional - will be computed as {namespace}_{name}
 				},
 			}
 			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
@@ -113,11 +112,12 @@ var _ = Describe("PostgresDatabase Controller", func() {
 				}
 			}()
 
-			mock.ExpectBegin()
-			mock.ExpectExec("CREATE DATABASE testdb;").WillReturnResult(sqlmock.NewResult(1, 1))
-			mock.ExpectExec("CREATE USER testuser WITH PASSWORD '.+';").WillReturnResult(sqlmock.NewResult(1, 1))
-			mock.ExpectExec("GRANT ALL PRIVILEGES ON DATABASE testdb TO testuser;").WillReturnResult(sqlmock.NewResult(1, 1))
-			mock.ExpectCommit()
+			// Database name and username will be computed as {namespace}_{name} = "default_test-database"
+			expectedDBName := "default_test-database"
+			expectedUserName := "default_test-database"
+			mock.ExpectExec(fmt.Sprintf("CREATE DATABASE \"%s\";", expectedDBName)).WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(fmt.Sprintf("CREATE USER \"%s\" WITH PASSWORD '.+';", expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(fmt.Sprintf("GRANT ALL PRIVILEGES ON DATABASE \"%s\" TO \"%s\";", expectedDBName, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
 
 			databaseReconciler := &PostgresDatabaseReconciler{
 				Client: k8sClient,

@@ -169,6 +169,34 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	@echo "Deleting CRDs and CRs first to allow operator to process finalizers..."
+	@if "$(KUBECTL)" get crd postgresdatabases.postgres.homelab.mortenolsen.pro >/dev/null 2>&1; then \
+		echo "Deleting PostgresDatabase resources..."; \
+		"$(KUBECTL)" delete postgresdatabases.postgres.homelab.mortenolsen.pro --all --all-namespaces --ignore-not-found=true || true; \
+		echo "Waiting for PostgresDatabase resources to be deleted..."; \
+		timeout=60; \
+		while [ $$timeout -gt 0 ]; do \
+			if ! "$(KUBECTL)" get postgresdatabases.postgres.homelab.mortenolsen.pro --all-namespaces 2>/dev/null | grep -v "No resources found" >/dev/null 2>&1; then \
+				break; \
+			fi; \
+			sleep 1; \
+			timeout=$$((timeout-1)); \
+		done; \
+	fi
+	@if "$(KUBECTL)" get crd postgresclusters.postgres.homelab.mortenolsen.pro >/dev/null 2>&1; then \
+		echo "Deleting PostgresCluster resources..."; \
+		"$(KUBECTL)" delete postgresclusters.postgres.homelab.mortenolsen.pro --all --all-namespaces --ignore-not-found=true || true; \
+		echo "Waiting for PostgresCluster resources to be deleted..."; \
+		timeout=60; \
+		while [ $$timeout -gt 0 ]; do \
+			if ! "$(KUBECTL)" get postgresclusters.postgres.homelab.mortenolsen.pro --all-namespaces 2>/dev/null | grep -v "No resources found" >/dev/null 2>&1; then \
+				break; \
+			fi; \
+			sleep 1; \
+			timeout=$$((timeout-1)); \
+		done; \
+	fi
+	@echo "Deleting operator deployment and other resources..."
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
 
 ##@ Dependencies

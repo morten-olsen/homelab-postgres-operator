@@ -34,16 +34,20 @@ type PostgresDatabaseSpec struct {
 	ClusterRef ClusterReference `json:"clusterRef"`
 
 	// DatabaseName is the name of the database to create.
+	// If not specified, it will be automatically set to {namespace}_{name}.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
-	DatabaseName string `json:"databaseName"`
+	// +optional
+	DatabaseName string `json:"databaseName,omitempty"`
 
 	// UserName is the name of the user (role) to create for this database.
+	// If not specified, it will be automatically set to {namespace}_{name}.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
-	UserName string `json:"userName"`
+	// +optional
+	UserName string `json:"userName,omitempty"`
 
 	// ReclaimPolicy defines what happens to the database and user when this resource is deleted.
 	// Can be "Retain" (default) or "Delete".

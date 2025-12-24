@@ -55,7 +55,9 @@ spec:
                 - name
                 type: object
               databaseName:
-                description: DatabaseName is the name of the database to create.
+                description: |-
+                  DatabaseName is the name of the database to create.
+                  If not specified, it will be automatically set to {namespace}_{name}.
                 maxLength: 63
                 minLength: 1
                 pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
@@ -70,16 +72,15 @@ spec:
                 - Delete
                 type: string
               userName:
-                description: UserName is the name of the user (role) to create for
-                  this database.
+                description: |-
+                  UserName is the name of the user (role) to create for this database.
+                  If not specified, it will be automatically set to {namespace}_{name}.
                 maxLength: 63
                 minLength: 1
                 pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                 type: string
             required:
             - clusterRef
-            - databaseName
-            - userName
             type: object
           status:
             description: status defines the observed state of PostgresDatabase
