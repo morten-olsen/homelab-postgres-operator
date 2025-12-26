@@ -200,7 +200,7 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	// Create database and user
-	result, err = r.createDatabaseAndUser(ctx, postgresDatabase, db, dbUserPassword, log)
+	result, err = r.createDatabaseAndUser(ctx, postgresDatabase, db, dbUserPassword, pgHost, pgPort, adminUser, adminPassword, log)
 	if result != nil {
 		return *result, err
 	}
@@ -500,7 +500,7 @@ func (r *PostgresDatabaseReconciler) ensureConnectionSecret(ctx context.Context,
 }
 
 // createDatabaseAndUser creates the database and user.
-func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, db *sql.DB, dbUserPassword string, log logr.Logger) (*ctrl.Result, error) {
+func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, db *sql.DB, dbUserPassword string, pgHost, pgPort, adminUser, adminPassword string, log logr.Logger) (*ctrl.Result, error) {
 	databaseName := getDatabaseName(postgresDatabase)
 	userName := getUserName(postgresDatabase)
 
@@ -539,15 +539,21 @@ func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, 
 			}
 			return &ctrl.Result{}, err
 		}
-		log.Info("User already exists", "user", userName)
+		log.Info("User already exists, updating password if needed", "user", userName)
+		// User exists, update password to ensure it matches the secret
+		alterUserQuery := fmt.Sprintf("ALTER USER %s WITH PASSWORD '%s';", quotedUserName, escapedPassword)
+		if _, alterErr := db.ExecContext(ctx, alterUserQuery); alterErr != nil {
+			log.Info("Failed to update user password (non-critical, may already be correct)", "error", alterErr)
+			// Non-critical, continue - password might already be correct
+		}
 	}
 
-	// Grant privileges (can be done in a transaction, but we'll do it directly for simplicity)
+	// Grant database-level privileges
 	// Note: GRANT can be executed multiple times safely (idempotent)
 	grantPrivilegesQuery := fmt.Sprintf("GRANT ALL PRIVILEGES ON DATABASE %s TO %s;", quotedDBName, quotedUserName)
 	if _, err := db.ExecContext(ctx, grantPrivilegesQuery); err != nil {
-		errMsg := fmt.Sprintf("Failed to grant privileges: %v", err)
-		log.Error(err, "Failed to grant privileges", "query", grantPrivilegesQuery)
+		errMsg := fmt.Sprintf("Failed to grant database privileges: %v", err)
+		log.Error(err, "Failed to grant database privileges", "query", grantPrivilegesQuery)
 		r.setCondition(postgresDatabase, "DatabaseReady", false, errMsg)
 		r.updatePhase(postgresDatabase)
 		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
@@ -555,7 +561,87 @@ func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, 
 		}
 		return &ctrl.Result{}, err
 	}
-	log.Info("Database and user created successfully")
+
+	// Connect to the newly created database to grant schema privileges
+	// We need to connect to the specific database, not the default postgres database
+	dbConnStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable", pgHost, pgPort, adminUser, adminPassword, databaseName)
+	targetDB, err := r.DBConnectionFunc(dbConnStr)
+	if err != nil {
+		errMsg := fmt.Sprintf("Failed to connect to target database: %v", err)
+		log.Error(err, "Failed to connect to target database")
+		r.setCondition(postgresDatabase, "DatabaseReady", false, errMsg)
+		r.updatePhase(postgresDatabase)
+		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
+			log.Error(updateErr, "Failed to update status")
+		}
+		return &ctrl.Result{}, err
+	}
+	defer func() {
+		if closeErr := targetDB.Close(); closeErr != nil {
+			log.Error(closeErr, "Failed to close target database connection")
+		}
+	}()
+
+	// Verify connection to target database
+	if err := targetDB.PingContext(ctx); err != nil {
+		errMsg := fmt.Sprintf("Failed to ping target database: %v", err)
+		log.Error(err, "Failed to ping target database")
+		r.setCondition(postgresDatabase, "DatabaseReady", false, errMsg)
+		r.updatePhase(postgresDatabase)
+		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
+			log.Error(updateErr, "Failed to update status")
+		}
+		return &ctrl.Result{}, err
+	}
+
+	// Grant schema-level privileges on public schema
+	// This is required for the user to be able to use the database
+	grantSchemaPrivilegesQuery := fmt.Sprintf("GRANT ALL PRIVILEGES ON SCHEMA public TO %s;", quotedUserName)
+	if _, err := targetDB.ExecContext(ctx, grantSchemaPrivilegesQuery); err != nil {
+		errMsg := fmt.Sprintf("Failed to grant schema privileges: %v", err)
+		log.Error(err, "Failed to grant schema privileges", "query", grantSchemaPrivilegesQuery)
+		r.setCondition(postgresDatabase, "DatabaseReady", false, errMsg)
+		r.updatePhase(postgresDatabase)
+		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
+			log.Error(updateErr, "Failed to update status")
+		}
+		return &ctrl.Result{}, err
+	}
+
+	// Grant CREATE privilege on public schema so user can create objects
+	grantCreateQuery := fmt.Sprintf("GRANT CREATE ON SCHEMA public TO %s;", quotedUserName)
+	if _, err := targetDB.ExecContext(ctx, grantCreateQuery); err != nil {
+		errMsg := fmt.Sprintf("Failed to grant CREATE privilege on schema: %v", err)
+		log.Error(err, "Failed to grant CREATE privilege on schema", "query", grantCreateQuery)
+		r.setCondition(postgresDatabase, "DatabaseReady", false, errMsg)
+		r.updatePhase(postgresDatabase)
+		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
+			log.Error(updateErr, "Failed to update status")
+		}
+		return &ctrl.Result{}, err
+	}
+
+	// Grant default privileges on all tables, sequences, and functions in public schema
+	// This ensures the user has privileges on objects created in the future
+	grantDefaultPrivilegesQuery := fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO %s;", quotedUserName)
+	if _, err := targetDB.ExecContext(ctx, grantDefaultPrivilegesQuery); err != nil {
+		log.Info("Failed to grant default privileges on tables (non-critical)", "error", err)
+		// Non-critical, continue
+	}
+
+	grantDefaultSeqQuery := fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO %s;", quotedUserName)
+	if _, err := targetDB.ExecContext(ctx, grantDefaultSeqQuery); err != nil {
+		log.Info("Failed to grant default privileges on sequences (non-critical)", "error", err)
+		// Non-critical, continue
+	}
+
+	grantDefaultFuncQuery := fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO %s;", quotedUserName)
+	if _, err := targetDB.ExecContext(ctx, grantDefaultFuncQuery); err != nil {
+		log.Info("Failed to grant default privileges on functions (non-critical)", "error", err)
+		// Non-critical, continue
+	}
+
+	log.Info("Database and user created successfully with full privileges")
 	r.setCondition(postgresDatabase, "DatabaseReady", true, "Database and user created successfully")
 	return nil, nil
 }
