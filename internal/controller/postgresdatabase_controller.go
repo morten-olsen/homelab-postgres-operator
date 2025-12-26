@@ -168,7 +168,7 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	adminUser := "postgres" // Default admin user
 	adminPassword := string(adminSecret.Data["password"])
-	pgHost := fmt.Sprintf("%s-service", postgresCluster.Name)
+	pgHost := fmt.Sprintf("%s-service.%s.svc.cluster.local", postgresCluster.Name, clusterNamespace)
 	pgPort := "5432"
 
 	// Ensure finalizer
@@ -320,7 +320,7 @@ func (r *PostgresDatabaseReconciler) handleDeletion(ctx context.Context, postgre
 	if clusterAvailable && adminSecret != nil && postgresDatabase.Spec.ReclaimPolicy == "Delete" {
 		adminUser := "postgres"
 		adminPassword := string(adminSecret.Data["password"])
-		pgHost := fmt.Sprintf("%s-service", postgresCluster.Name)
+		pgHost := fmt.Sprintf("%s-service.%s.svc.cluster.local", postgresCluster.Name, clusterNamespace)
 		pgPort := "5432"
 
 		psqlConn := fmt.Sprintf("host=%s port=%s user=%s password=%s sslmode=disable", pgHost, pgPort, adminUser, adminPassword)
