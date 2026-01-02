@@ -99,8 +99,11 @@ func dropDatabaseAndUser(ctx context.Context, postgresDatabase *postgresv1.Postg
 }
 
 // generateRandomPassword generates a random password of the given length.
+// Uses only URL-safe characters to ensure the password can be used directly in PostgreSQL URLs.
 func generateRandomPassword(length int) (string, error) {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_+="
+	// URL-safe charset: letters, digits, and safe special characters (-, _, ., ~)
+	// These characters don't require URL encoding when used in connection strings
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_~"
 	b := make([]byte, length)
 	_, err := rand.Read(b)
 	if err != nil {
