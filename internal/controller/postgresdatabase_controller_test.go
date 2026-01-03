@@ -20,12 +20,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -51,6 +50,18 @@ var _ = Describe("PostgresDatabase Controller", func() {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      clusterName,
 					Namespace: "default",
+				},
+				Spec: postgresv1.PostgresClusterSpec{
+					Host: &postgresv1.StringOrSecret{
+						Value: "localhost",
+					},
+					Port: 5432,
+					User: &postgresv1.StringOrSecret{
+						Value: "postgres",
+					},
+					Password: &postgresv1.StringOrSecret{
+						Value: "testpassword",
+					},
 				},
 			}
 			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
@@ -87,21 +98,27 @@ var _ = Describe("PostgresDatabase Controller", func() {
 
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created PostgresCluster resource")
+			clusterDB, clusterMock, err := sqlmock.New()
+			Expect(err).NotTo(HaveOccurred())
+			defer func() {
+				_ = clusterDB.Close() // Ignore close error in test cleanup
+			}()
+			clusterMock.ExpectPing()
+
 			clusterReconciler := &PostgresClusterReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
+				TestConnection: func(ctx context.Context, host string, port int, user, password string, log logr.Logger) (bool, string) {
+					if pingErr := clusterDB.PingContext(ctx); pingErr != nil {
+						return false, pingErr.Error()
+					}
+					return true, "Successfully connected to PostgreSQL"
+				},
 			}
-			_, err := clusterReconciler.Reconcile(ctx, reconcile.Request{
+			_, err = clusterReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: "default"},
 			})
 			Expect(err).NotTo(HaveOccurred())
-
-			By("Waiting for the admin secret to be created")
-			Eventually(func() bool {
-				secret := &corev1.Secret{}
-				err := k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-admin-secret", Namespace: "default"}, secret)
-				return err == nil
-			}, time.Second*10, time.Millisecond*250).Should(BeTrue())
 
 			By("Updating PostgresCluster status to Ready")
 			cluster := &postgresv1.PostgresCluster{}
@@ -117,14 +134,13 @@ var _ = Describe("PostgresDatabase Controller", func() {
 				},
 			}
 			Expect(k8sClient.Status().Update(ctx, cluster)).To(Succeed())
+			Expect(clusterMock.ExpectationsWereMet()).Should(Succeed())
 
 			By("Reconciling the created PostgresDatabase resource with a mock database")
 			db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 			Expect(err).NotTo(HaveOccurred())
 			defer func() {
-				if closeErr := db.Close(); closeErr != nil {
-					Fail(fmt.Sprintf("Failed to close database connection: %v", closeErr))
-				}
+				_ = db.Close() // Ignore close error in test cleanup
 			}()
 
 			// Database name and username will be computed as {namespace}_{name} = "default_test-database"
@@ -133,6 +149,13 @@ var _ = Describe("PostgresDatabase Controller", func() {
 			mock.ExpectExec(fmt.Sprintf(`CREATE DATABASE "%s";`, expectedDBName)).WillReturnResult(sqlmock.NewResult(1, 1))
 			mock.ExpectExec(fmt.Sprintf(`CREATE USER "%s" WITH PASSWORD '.+';`, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
 			mock.ExpectExec(fmt.Sprintf(`GRANT ALL PRIVILEGES ON DATABASE "%s" TO "%s";`, expectedDBName, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
+			// Additional queries for schema privileges
+			mock.ExpectPing() // Ping when connecting to the target database
+			mock.ExpectExec(fmt.Sprintf(`GRANT ALL PRIVILEGES ON SCHEMA public TO "%s";`, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(fmt.Sprintf(`GRANT CREATE ON SCHEMA public TO "%s";`, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(fmt.Sprintf(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO "%s";`, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(fmt.Sprintf(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO "%s";`, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(fmt.Sprintf(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO "%s";`, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
 
 			databaseReconciler := &PostgresDatabaseReconciler{
 				Client: k8sClient,

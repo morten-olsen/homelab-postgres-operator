@@ -39,10 +39,93 @@ spec:
           spec:
             description: spec defines the desired state of PostgresCluster
             properties:
-              image:
-                default: pgvector/pgvector:pg18
-                description: image is the container image to use for the cluster.
-                type: string
+              host:
+                description: |-
+                  host is the hostname or IP address of the PostgreSQL server.
+                  Either host or hostFrom must be specified.
+                properties:
+                  value:
+                    description: value is a literal string value.
+                    type: string
+                  valueFrom:
+                    description: valueFrom is a reference to a secret key.
+                    properties:
+                      key:
+                        description: key is the key in the secret to select.
+                        type: string
+                      name:
+                        description: name is the name of the secret in the same namespace
+                          as the PostgresCluster.
+                        type: string
+                      namespace:
+                        description: namespace is the namespace of the secret. If
+                          not specified, defaults to the PostgresCluster namespace.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                type: object
+              password:
+                description: |-
+                  password is the password for connecting to the PostgreSQL server.
+                  Either password or passwordFrom must be specified.
+                properties:
+                  value:
+                    description: value is a literal string value.
+                    type: string
+                  valueFrom:
+                    description: valueFrom is a reference to a secret key.
+                    properties:
+                      key:
+                        description: key is the key in the secret to select.
+                        type: string
+                      name:
+                        description: name is the name of the secret in the same namespace
+                          as the PostgresCluster.
+                        type: string
+                      namespace:
+                        description: namespace is the namespace of the secret. If
+                          not specified, defaults to the PostgresCluster namespace.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                type: object
+              port:
+                default: 5432
+                description: |-
+                  port is the port number of the PostgreSQL server.
+                  Defaults to 5432 if not specified.
+                type: integer
+              user:
+                description: |-
+                  user is the username for connecting to the PostgreSQL server.
+                  Either user or userFrom must be specified.
+                properties:
+                  value:
+                    description: value is a literal string value.
+                    type: string
+                  valueFrom:
+                    description: valueFrom is a reference to a secret key.
+                    properties:
+                      key:
+                        description: key is the key in the secret to select.
+                        type: string
+                      name:
+                        description: name is the name of the secret in the same namespace
+                          as the PostgresCluster.
+                        type: string
+                      namespace:
+                        description: namespace is the namespace of the secret. If
+                          not specified, defaults to the PostgresCluster namespace.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                type: object
             type: object
           status:
             description: status defines the observed state of PostgresCluster
