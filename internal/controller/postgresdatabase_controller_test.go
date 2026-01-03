@@ -52,15 +52,8 @@ var _ = Describe("PostgresDatabase Controller", func() {
 					Namespace: "default",
 				},
 				Spec: postgresv1.PostgresClusterSpec{
-					Host: &postgresv1.StringOrSecret{
-						Value: "localhost",
-					},
-					Port: 5432,
-					User: &postgresv1.StringOrSecret{
-						Value: "postgres",
-					},
-					Password: &postgresv1.StringOrSecret{
-						Value: "testpassword",
+					URL: &postgresv1.StringOrSecret{
+						Value: "postgresql://postgres:testpassword@localhost:5432/postgres?sslmode=disable",
 					},
 				},
 			}
@@ -108,7 +101,7 @@ var _ = Describe("PostgresDatabase Controller", func() {
 			clusterReconciler := &PostgresClusterReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
-				TestConnection: func(ctx context.Context, host string, port int, user, password string, log logr.Logger) (bool, string) {
+				TestConnection: func(ctx context.Context, urlStr string, log logr.Logger) (bool, string) {
 					if pingErr := clusterDB.PingContext(ctx); pingErr != nil {
 						return false, pingErr.Error()
 					}

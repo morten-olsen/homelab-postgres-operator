@@ -400,7 +400,7 @@ spec:
 				g.Expect(output).To(Equal("1"), "PostgreSQL StatefulSet should have 1 ready replica")
 			}, "5m", "5s").Should(Succeed())
 
-			By("creating a PostgresCluster resource with connection details")
+			By("creating a PostgresCluster resource with connection URL")
 			cluster := fmt.Sprintf(`
 apiVersion: postgres.homelab.mortenolsen.pro/v1
 kind: PostgresCluster
@@ -408,16 +408,9 @@ metadata:
   name: %s
   namespace: %s
 spec:
-  host:
-    value: %s.%s.svc.cluster.local
-  port: 5432
-  user:
-    value: postgres
-  password:
-    valueFrom:
-      name: %s-secret
-      key: password
-`, clusterName, namespace, postgresServerName, namespace, postgresServerName)
+  url:
+    value: postgresql://postgres:%s@%s.%s.svc.cluster.local:5432/postgres?sslmode=disable
+`, clusterName, namespace, postgresPassword, postgresServerName, namespace)
 			cmd = exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cluster)
 			_, err = utils.Run(cmd)

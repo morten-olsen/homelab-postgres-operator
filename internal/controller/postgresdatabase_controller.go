@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -160,12 +161,24 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
-	// Resolve connection details from PostgresCluster spec
-	pgHost, pgPort, adminUser, adminPassword, result, err := r.resolveClusterConnection(ctx, postgresDatabase, postgresCluster, clusterNamespace, log)
+	// Resolve connection URL from PostgresCluster spec
+	pgURL, result, err := r.resolveClusterConnection(ctx, postgresDatabase, postgresCluster, clusterNamespace, log)
 	if result != nil {
 		return *result, err
 	}
 	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// Parse connection details from URL for status updates
+	pgHost, pgPort, _, _, err := r.parsePostgresURL(pgURL)
+	if err != nil {
+		log.Error(err, "Failed to parse PostgreSQL URL")
+		r.setCondition(postgresDatabase, "SecretReady", false, fmt.Sprintf("Failed to parse URL: %v", err))
+		r.updatePhase(postgresDatabase)
+		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
+			log.Error(updateErr, "Failed to update status")
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -174,8 +187,8 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
-	// Connect to database
-	db, result, err := r.connectToDatabase(ctx, postgresDatabase, pgHost, fmt.Sprintf("%d", pgPort), adminUser, adminPassword, log)
+	// Connect to database using the URL
+	db, result, err := r.connectToDatabase(ctx, postgresDatabase, pgURL, log)
 	if result != nil {
 		return *result, err
 	}
@@ -198,7 +211,7 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	// Create database and user
-	result, err = r.createDatabaseAndUser(ctx, postgresDatabase, db, dbUserPassword, pgHost, fmt.Sprintf("%d", pgPort), adminUser, adminPassword, log)
+	result, err = r.createDatabaseAndUser(ctx, postgresDatabase, db, dbUserPassword, pgURL, log)
 	if result != nil {
 		return *result, err
 	}
@@ -258,70 +271,100 @@ func (r *PostgresDatabaseReconciler) fetchAndValidateCluster(ctx context.Context
 	return postgresCluster, clusterNamespace, nil, nil
 }
 
-// resolveClusterConnection resolves connection details from PostgresCluster spec.
-// Returns host, port, user, password, result (if requeue needed), and error.
-func (r *PostgresDatabaseReconciler) resolveClusterConnection(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, postgresCluster *postgresv1.PostgresCluster, clusterNamespace string, log logr.Logger) (string, int, string, string, *ctrl.Result, error) {
-	// Resolve host
-	host, result, err := r.resolveStringOrSecret(ctx, postgresDatabase, postgresCluster.Spec.Host, "host", clusterNamespace, log)
+// resolveClusterConnection resolves connection URL from PostgresCluster spec.
+// Returns URL string, result (if requeue needed), and error.
+func (r *PostgresDatabaseReconciler) resolveClusterConnection(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, postgresCluster *postgresv1.PostgresCluster, clusterNamespace string, log logr.Logger) (string, *ctrl.Result, error) {
+	// Resolve URL
+	urlStr, result, err := r.resolveStringOrSecret(ctx, postgresDatabase, postgresCluster.Spec.URL, "url", clusterNamespace, log)
 	if result != nil {
-		return "", 0, "", "", result, err
+		return "", result, err
 	}
 	if err != nil {
-		return "", 0, "", "", nil, err
+		return "", nil, err
 	}
 
-	// Resolve user
-	user, result, err := r.resolveStringOrSecret(ctx, postgresDatabase, postgresCluster.Spec.User, "user", clusterNamespace, log)
-	if result != nil {
-		return "", 0, "", "", result, err
-	}
-	if err != nil {
-		return "", 0, "", "", nil, err
-	}
-
-	// Resolve password
-	password, result, err := r.resolveStringOrSecret(ctx, postgresDatabase, postgresCluster.Spec.Password, "password", clusterNamespace, log)
-	if result != nil {
-		return "", 0, "", "", result, err
-	}
-	if err != nil {
-		return "", 0, "", "", nil, err
+	// Validate that URL is present
+	if urlStr == "" {
+		r.setCondition(postgresDatabase, "SecretReady", false, "PostgresCluster url is not configured")
+		r.updatePhase(postgresDatabase)
+		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
+			log.Error(updateErr, "Failed to update status")
+		}
+		return "", nil, fmt.Errorf("PostgresCluster url is not configured")
 	}
 
-	// Get port (default to 5432)
-	port := postgresCluster.Spec.Port
+	r.setCondition(postgresDatabase, "SecretReady", true, "Connection URL resolved from PostgresCluster")
+	return urlStr, nil, nil
+}
+
+// parsePostgresURL parses a PostgreSQL URL or connection string and returns connection details.
+func (r *PostgresDatabaseReconciler) parsePostgresURL(urlStr string) (host string, port int, user string, password string, err error) {
+	// Try parsing as URL first
+	if strings.HasPrefix(urlStr, "postgresql://") || strings.HasPrefix(urlStr, "postgres://") {
+		parsedURL, err := url.Parse(urlStr)
+		if err != nil {
+			return "", 0, "", "", fmt.Errorf("failed to parse URL: %w", err)
+		}
+
+		host = parsedURL.Hostname()
+		if host == "" {
+			return "", 0, "", "", fmt.Errorf("host is required in URL")
+		}
+
+		if parsedURL.Port() != "" {
+			if p, err := fmt.Sscanf(parsedURL.Port(), "%d", &port); err != nil || p != 1 {
+				return "", 0, "", "", fmt.Errorf("invalid port in URL: %s", parsedURL.Port())
+			}
+		} else {
+			port = 5432
+		}
+
+		if parsedURL.User != nil {
+			user = parsedURL.User.Username()
+			password, _ = parsedURL.User.Password()
+		}
+
+		return host, port, user, password, nil
+	}
+
+	// Try parsing as connection string (key=value format)
+	// Parse the connection string manually, handling quoted values
+	parseConnectionStringPart := func(part, key string) string {
+		prefix := key + "="
+		if !strings.HasPrefix(part, prefix) {
+			return ""
+		}
+		value := strings.TrimPrefix(part, prefix)
+		// Remove quotes if present
+		if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+			value = value[1 : len(value)-1]
+		}
+		return value
+	}
+
+	parts := strings.Fields(urlStr)
+	for _, part := range parts {
+		if h := parseConnectionStringPart(part, "host"); h != "" {
+			host = h
+		} else if p := parseConnectionStringPart(part, "port"); p != "" {
+			if portVal, err := fmt.Sscanf(p, "%d", &port); err != nil || portVal != 1 {
+				return "", 0, "", "", fmt.Errorf("invalid port in connection string: %s", p)
+			}
+		} else if u := parseConnectionStringPart(part, "user"); u != "" {
+			user = u
+		} else if pw := parseConnectionStringPart(part, "password"); pw != "" {
+			password = pw
+		}
+	}
+
+	if host == "" {
+		host = "localhost"
+	}
 	if port == 0 {
 		port = 5432
 	}
 
-	// Validate that all required fields are present
-	if host == "" {
-		r.setCondition(postgresDatabase, "SecretReady", false, "PostgresCluster host is not configured")
-		r.updatePhase(postgresDatabase)
-		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
-			log.Error(updateErr, "Failed to update status")
-		}
-		return "", 0, "", "", nil, fmt.Errorf("PostgresCluster host is not configured")
-	}
-	if user == "" {
-		r.setCondition(postgresDatabase, "SecretReady", false, "PostgresCluster user is not configured")
-		r.updatePhase(postgresDatabase)
-		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
-			log.Error(updateErr, "Failed to update status")
-		}
-		return "", 0, "", "", nil, fmt.Errorf("PostgresCluster user is not configured")
-	}
-	if password == "" {
-		r.setCondition(postgresDatabase, "SecretReady", false, "PostgresCluster password is not configured")
-		r.updatePhase(postgresDatabase)
-		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
-			log.Error(updateErr, "Failed to update status")
-		}
-		return "", 0, "", "", nil, fmt.Errorf("PostgresCluster password is not configured")
-	}
-
-	r.setCondition(postgresDatabase, "SecretReady", true, "Connection details resolved from PostgresCluster")
-	return host, port, user, password, nil, nil
+	return host, port, user, password, nil
 }
 
 // resolveStringOrSecret resolves a StringOrSecret to its actual string value.
@@ -389,23 +432,21 @@ func (r *PostgresDatabaseReconciler) handleDeletion(ctx context.Context, postgre
 	err := r.Get(ctx, types.NamespacedName{Name: postgresDatabase.Spec.ClusterRef.Name, Namespace: clusterNamespace}, postgresCluster)
 	clusterAvailable := err == nil
 
-	var pgHost string
-	var pgPort int
-	var adminUser string
-	var adminPassword string
+	var pgURL string
 	if clusterAvailable {
-		// Try to resolve connection details
+		// Try to resolve connection URL
 		var resolveErr error
-		pgHost, pgPort, adminUser, adminPassword, _, resolveErr = r.resolveClusterConnection(ctx, postgresDatabase, postgresCluster, clusterNamespace, log)
+		pgURL, _, resolveErr = r.resolveClusterConnection(ctx, postgresDatabase, postgresCluster, clusterNamespace, log)
 		if resolveErr != nil {
 			clusterAvailable = false
 		}
 	}
 
-	// Only attempt cleanup if cluster and connection details are available and ReclaimPolicy is Delete
-	if clusterAvailable && pgHost != "" && adminUser != "" && adminPassword != "" && postgresDatabase.Spec.ReclaimPolicy == "Delete" {
-		psqlConn := fmt.Sprintf("host=%s port=%d user=%s password=%s sslmode=disable", pgHost, pgPort, adminUser, adminPassword)
-		db, err := r.DBConnectionFunc(psqlConn)
+	// Only attempt cleanup if cluster and connection URL are available and ReclaimPolicy is Delete
+	if clusterAvailable && pgURL != "" && postgresDatabase.Spec.ReclaimPolicy == "Delete" {
+		// Ensure we connect to the postgres database for cleanup
+		cleanupURL := r.ensureDatabaseInURL(pgURL, "postgres")
+		db, err := r.DBConnectionFunc(cleanupURL)
 		if err != nil {
 			log.Error(err, "Failed to open database connection during finalization, will still remove finalizer")
 		} else {
@@ -472,10 +513,11 @@ func (r *PostgresDatabaseReconciler) ensureFinalizer(ctx context.Context, postgr
 	return nil
 }
 
-// connectToDatabase connects to the PostgreSQL database.
-func (r *PostgresDatabaseReconciler) connectToDatabase(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, pgHost, pgPort, adminUser, adminPassword string, log logr.Logger) (*sql.DB, *ctrl.Result, error) {
-	psqlConn := fmt.Sprintf("host=%s port=%s user=%s password=%s sslmode=disable", pgHost, pgPort, adminUser, adminPassword)
-	db, err := r.DBConnectionFunc(psqlConn)
+// connectToDatabase connects to the PostgreSQL database using the provided URL.
+func (r *PostgresDatabaseReconciler) connectToDatabase(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, pgURL string, log logr.Logger) (*sql.DB, *ctrl.Result, error) {
+	// Ensure we connect to the postgres database (not a specific database)
+	testURL := r.ensureDatabaseInURL(pgURL, "postgres")
+	db, err := r.DBConnectionFunc(testURL)
 	if err != nil {
 		errMsg := fmt.Sprintf("Failed to open database connection: %v", err)
 		log.Error(err, "Failed to open database connection")
@@ -501,6 +543,33 @@ func (r *PostgresDatabaseReconciler) connectToDatabase(ctx context.Context, post
 	log.Info("Successfully connected to PostgresCluster")
 	r.setCondition(postgresDatabase, "ConnectionReady", true, "Successfully connected to PostgreSQL")
 	return db, nil, nil
+}
+
+// ensureDatabaseInURL ensures the database name is set in the URL/connection string.
+func (r *PostgresDatabaseReconciler) ensureDatabaseInURL(urlStr, dbName string) string {
+	if strings.HasPrefix(urlStr, "postgresql://") || strings.HasPrefix(urlStr, "postgres://") {
+		// URL format - ensure it has the database in the path
+		parsedURL, err := url.Parse(urlStr)
+		if err == nil {
+			// Replace path with /{dbName} if empty or different
+			if parsedURL.Path == "" || parsedURL.Path == "/" {
+				parsedURL.Path = "/" + dbName
+			}
+			return parsedURL.String()
+		}
+		// If parsing fails, return original
+		return urlStr
+	}
+
+	// Connection string format - add dbname if not present
+	if !strings.Contains(urlStr, "dbname=") {
+		if strings.Contains(urlStr, "?") {
+			return strings.Replace(urlStr, "?", fmt.Sprintf(" dbname=%s?", dbName), 1)
+		}
+		return urlStr + fmt.Sprintf(" dbname=%s", dbName)
+	}
+
+	return urlStr
 }
 
 // ensureConnectionSecret ensures the connection secret exists.
@@ -581,7 +650,7 @@ func (r *PostgresDatabaseReconciler) ensureConnectionSecret(ctx context.Context,
 }
 
 // createDatabaseAndUser creates the database and user.
-func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, db *sql.DB, dbUserPassword string, pgHost, pgPort, adminUser, adminPassword string, log logr.Logger) (*ctrl.Result, error) {
+func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, db *sql.DB, dbUserPassword string, pgURL string, log logr.Logger) (*ctrl.Result, error) {
 	databaseName := getDatabaseName(postgresDatabase)
 	userName := getUserName(postgresDatabase)
 
@@ -645,8 +714,8 @@ func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, 
 
 	// Connect to the newly created database to grant schema privileges
 	// We need to connect to the specific database, not the default postgres database
-	dbConnStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable", pgHost, pgPort, adminUser, adminPassword, databaseName)
-	targetDB, err := r.DBConnectionFunc(dbConnStr)
+	targetDBURL := r.ensureDatabaseInURL(pgURL, databaseName)
+	targetDB, err := r.DBConnectionFunc(targetDBURL)
 	if err != nil {
 		errMsg := fmt.Sprintf("Failed to connect to target database: %v", err)
 		log.Error(err, "Failed to connect to target database")

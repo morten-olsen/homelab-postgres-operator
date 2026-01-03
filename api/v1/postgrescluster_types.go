@@ -30,26 +30,12 @@ type PostgresClusterSpec struct {
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
-	// host is the hostname or IP address of the PostgreSQL server.
-	// Either host or hostFrom must be specified.
+	// url is the PostgreSQL connection URL.
+	// Can be in the format: postgresql://user:password@host:port/database?sslmode=disable
+	// Or as a connection string: host=host port=5432 user=user password=password dbname=postgres sslmode=disable
+	// Either value or valueFrom must be specified.
 	// +optional
-	Host *StringOrSecret `json:"host,omitempty"`
-
-	// port is the port number of the PostgreSQL server.
-	// Defaults to 5432 if not specified.
-	// +kubebuilder:default:=5432
-	// +optional
-	Port int `json:"port,omitempty"`
-
-	// user is the username for connecting to the PostgreSQL server.
-	// Either user or userFrom must be specified.
-	// +optional
-	User *StringOrSecret `json:"user,omitempty"`
-
-	// password is the password for connecting to the PostgreSQL server.
-	// Either password or passwordFrom must be specified.
-	// +optional
-	Password *StringOrSecret `json:"password,omitempty"`
+	URL *StringOrSecret `json:"url,omitempty"`
 }
 
 // StringOrSecret represents a value that can either be a literal string or a reference to a secret.
