@@ -160,8 +160,8 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
-	// Get admin secret
-	adminSecret, result, err := r.fetchAdminSecret(ctx, postgresDatabase, postgresCluster, clusterNamespace, log)
+	// Resolve connection details from PostgresCluster spec
+	pgHost, pgPort, adminUser, adminPassword, result, err := r.resolveClusterConnection(ctx, postgresDatabase, postgresCluster, clusterNamespace, log)
 	if result != nil {
 		return *result, err
 	}
@@ -169,18 +169,13 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
-	adminUser := "postgres" // Default admin user
-	adminPassword := string(adminSecret.Data["password"])
-	pgHost := fmt.Sprintf("%s-service.%s.svc.cluster.local", postgresCluster.Name, clusterNamespace)
-	pgPort := "5432"
-
 	// Ensure finalizer
 	if err := r.ensureFinalizer(ctx, postgresDatabase); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// Connect to database
-	db, result, err := r.connectToDatabase(ctx, postgresDatabase, pgHost, pgPort, adminUser, adminPassword, log)
+	db, result, err := r.connectToDatabase(ctx, postgresDatabase, pgHost, fmt.Sprintf("%d", pgPort), adminUser, adminPassword, log)
 	if result != nil {
 		return *result, err
 	}
@@ -194,7 +189,7 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}()
 
 	// Create/update connection secret
-	dbUserPassword, result, err := r.ensureConnectionSecret(ctx, postgresDatabase, pgHost, pgPort, log)
+	dbUserPassword, result, err := r.ensureConnectionSecret(ctx, postgresDatabase, pgHost, fmt.Sprintf("%d", pgPort), log)
 	if result != nil {
 		return *result, err
 	}
@@ -203,7 +198,7 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	// Create database and user
-	result, err = r.createDatabaseAndUser(ctx, postgresDatabase, db, dbUserPassword, pgHost, pgPort, adminUser, adminPassword, log)
+	result, err = r.createDatabaseAndUser(ctx, postgresDatabase, db, dbUserPassword, pgHost, fmt.Sprintf("%d", pgPort), adminUser, adminPassword, log)
 	if result != nil {
 		return *result, err
 	}
@@ -212,7 +207,7 @@ func (r *PostgresDatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	// Update PostgresDatabase status
-	if err := r.updateStatus(ctx, postgresDatabase, pgHost, pgPort); err != nil {
+	if err := r.updateStatus(ctx, postgresDatabase, pgHost, fmt.Sprintf("%d", pgPort)); err != nil {
 		log.Error(err, "Failed to update PostgresDatabase status")
 		return ctrl.Result{}, err
 	}
@@ -263,31 +258,114 @@ func (r *PostgresDatabaseReconciler) fetchAndValidateCluster(ctx context.Context
 	return postgresCluster, clusterNamespace, nil, nil
 }
 
-// fetchAdminSecret fetches the admin secret for the PostgresCluster.
-func (r *PostgresDatabaseReconciler) fetchAdminSecret(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, postgresCluster *postgresv1.PostgresCluster, clusterNamespace string, log logr.Logger) (*corev1.Secret, *ctrl.Result, error) {
-	adminSecretName := fmt.Sprintf("%s-admin-secret", postgresCluster.Name)
-	adminSecret := &corev1.Secret{}
-	err := r.Get(ctx, types.NamespacedName{Name: adminSecretName, Namespace: clusterNamespace}, adminSecret)
+// resolveClusterConnection resolves connection details from PostgresCluster spec.
+// Returns host, port, user, password, result (if requeue needed), and error.
+func (r *PostgresDatabaseReconciler) resolveClusterConnection(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, postgresCluster *postgresv1.PostgresCluster, clusterNamespace string, log logr.Logger) (string, int, string, string, *ctrl.Result, error) {
+	// Resolve host
+	host, result, err := r.resolveStringOrSecret(ctx, postgresDatabase, postgresCluster.Spec.Host, "host", clusterNamespace, log)
+	if result != nil {
+		return "", 0, "", "", result, err
+	}
 	if err != nil {
-		if errors.IsNotFound(err) {
-			log.Info("Admin secret for PostgresCluster not found, requeueing", "Secret.Name", adminSecretName)
-			r.setCondition(postgresDatabase, "SecretReady", false, fmt.Sprintf("Admin secret %s/%s not found", clusterNamespace, adminSecretName))
-			r.updatePhase(postgresDatabase)
-			if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
-				log.Error(updateErr, "Failed to update status")
-			}
-			return nil, &ctrl.Result{Requeue: true}, nil
-		}
-		log.Error(err, "Failed to get admin secret for PostgresCluster")
-		r.setCondition(postgresDatabase, "SecretReady", false, fmt.Sprintf("Failed to get admin secret: %v", err))
+		return "", 0, "", "", nil, err
+	}
+
+	// Resolve user
+	user, result, err := r.resolveStringOrSecret(ctx, postgresDatabase, postgresCluster.Spec.User, "user", clusterNamespace, log)
+	if result != nil {
+		return "", 0, "", "", result, err
+	}
+	if err != nil {
+		return "", 0, "", "", nil, err
+	}
+
+	// Resolve password
+	password, result, err := r.resolveStringOrSecret(ctx, postgresDatabase, postgresCluster.Spec.Password, "password", clusterNamespace, log)
+	if result != nil {
+		return "", 0, "", "", result, err
+	}
+	if err != nil {
+		return "", 0, "", "", nil, err
+	}
+
+	// Get port (default to 5432)
+	port := postgresCluster.Spec.Port
+	if port == 0 {
+		port = 5432
+	}
+
+	// Validate that all required fields are present
+	if host == "" {
+		r.setCondition(postgresDatabase, "SecretReady", false, "PostgresCluster host is not configured")
 		r.updatePhase(postgresDatabase)
 		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 			log.Error(updateErr, "Failed to update status")
 		}
-		return nil, nil, err
+		return "", 0, "", "", nil, fmt.Errorf("PostgresCluster host is not configured")
 	}
-	r.setCondition(postgresDatabase, "SecretReady", true, "Admin secret found")
-	return adminSecret, nil, nil
+	if user == "" {
+		r.setCondition(postgresDatabase, "SecretReady", false, "PostgresCluster user is not configured")
+		r.updatePhase(postgresDatabase)
+		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
+			log.Error(updateErr, "Failed to update status")
+		}
+		return "", 0, "", "", nil, fmt.Errorf("PostgresCluster user is not configured")
+	}
+	if password == "" {
+		r.setCondition(postgresDatabase, "SecretReady", false, "PostgresCluster password is not configured")
+		r.updatePhase(postgresDatabase)
+		if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
+			log.Error(updateErr, "Failed to update status")
+		}
+		return "", 0, "", "", nil, fmt.Errorf("PostgresCluster password is not configured")
+	}
+
+	r.setCondition(postgresDatabase, "SecretReady", true, "Connection details resolved from PostgresCluster")
+	return host, port, user, password, nil, nil
+}
+
+// resolveStringOrSecret resolves a StringOrSecret to its actual string value.
+func (r *PostgresDatabaseReconciler) resolveStringOrSecret(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, strOrSecret *postgresv1.StringOrSecret, fieldName string, clusterNamespace string, log logr.Logger) (string, *ctrl.Result, error) {
+	if strOrSecret == nil {
+		return "", nil, fmt.Errorf("%s is required", fieldName)
+	}
+
+	// Check if it's a literal value
+	if strOrSecret.Value != "" {
+		return strOrSecret.Value, nil, nil
+	}
+
+	// Check if it's a secret reference
+	if strOrSecret.ValueFrom == nil {
+		return "", nil, fmt.Errorf("%s must specify either value or valueFrom", fieldName)
+	}
+
+	secretNamespace := clusterNamespace
+	if strOrSecret.ValueFrom.Namespace != "" {
+		secretNamespace = strOrSecret.ValueFrom.Namespace
+	}
+
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: strOrSecret.ValueFrom.Name, Namespace: secretNamespace}, secret)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			log.Info("Secret not found, requeueing", "Secret.Name", strOrSecret.ValueFrom.Name, "Secret.Namespace", secretNamespace, "Field", fieldName)
+			r.setCondition(postgresDatabase, "SecretReady", false, fmt.Sprintf("Secret %s/%s not found for %s", secretNamespace, strOrSecret.ValueFrom.Name, fieldName))
+			r.updatePhase(postgresDatabase)
+			if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
+				log.Error(updateErr, "Failed to update status")
+			}
+			return "", &ctrl.Result{Requeue: true}, nil
+		}
+		return "", nil, fmt.Errorf("failed to get secret %s/%s: %w", secretNamespace, strOrSecret.ValueFrom.Name, err)
+	}
+
+	value, exists := secret.Data[strOrSecret.ValueFrom.Key]
+	if !exists {
+		return "", nil, fmt.Errorf("key %s not found in secret %s/%s", strOrSecret.ValueFrom.Key, secretNamespace, strOrSecret.ValueFrom.Name)
+	}
+
+	return string(value), nil, nil
 }
 
 // handleDeletion handles the deletion of a PostgresDatabase.
@@ -311,22 +389,22 @@ func (r *PostgresDatabaseReconciler) handleDeletion(ctx context.Context, postgre
 	err := r.Get(ctx, types.NamespacedName{Name: postgresDatabase.Spec.ClusterRef.Name, Namespace: clusterNamespace}, postgresCluster)
 	clusterAvailable := err == nil
 
-	var adminSecret *corev1.Secret
+	var pgHost string
+	var pgPort int
+	var adminUser string
+	var adminPassword string
 	if clusterAvailable {
-		adminSecretName := fmt.Sprintf("%s-admin-secret", postgresCluster.Name)
-		adminSecret = &corev1.Secret{}
-		err = r.Get(ctx, types.NamespacedName{Name: adminSecretName, Namespace: clusterNamespace}, adminSecret)
-		clusterAvailable = err == nil
+		// Try to resolve connection details
+		var resolveErr error
+		pgHost, pgPort, adminUser, adminPassword, _, resolveErr = r.resolveClusterConnection(ctx, postgresDatabase, postgresCluster, clusterNamespace, log)
+		if resolveErr != nil {
+			clusterAvailable = false
+		}
 	}
 
-	// Only attempt cleanup if cluster and secret are available and ReclaimPolicy is Delete
-	if clusterAvailable && adminSecret != nil && postgresDatabase.Spec.ReclaimPolicy == "Delete" {
-		adminUser := "postgres"
-		adminPassword := string(adminSecret.Data["password"])
-		pgHost := fmt.Sprintf("%s-service.%s.svc.cluster.local", postgresCluster.Name, clusterNamespace)
-		pgPort := "5432"
-
-		psqlConn := fmt.Sprintf("host=%s port=%s user=%s password=%s sslmode=disable", pgHost, pgPort, adminUser, adminPassword)
+	// Only attempt cleanup if cluster and connection details are available and ReclaimPolicy is Delete
+	if clusterAvailable && pgHost != "" && adminUser != "" && adminPassword != "" && postgresDatabase.Spec.ReclaimPolicy == "Delete" {
+		psqlConn := fmt.Sprintf("host=%s port=%d user=%s password=%s sslmode=disable", pgHost, pgPort, adminUser, adminPassword)
 		db, err := r.DBConnectionFunc(psqlConn)
 		if err != nil {
 			log.Error(err, "Failed to open database connection during finalization, will still remove finalizer")
@@ -687,9 +765,16 @@ func (r *PostgresDatabaseReconciler) updateStatus(ctx context.Context, postgresD
 	if overallReady {
 		databaseName := getDatabaseName(postgresDatabase)
 		userName := getUserName(postgresDatabase)
+		portInt := 5432
+		if pgPort != "" {
+			if _, err := fmt.Sscanf(pgPort, "%d", &portInt); err != nil {
+				// If parsing fails, use default port
+				portInt = 5432
+			}
+		}
 		postgresDatabase.Status.Connection = &postgresv1.PostgresDatabaseConnection{
 			Host:     pgHost,
-			Port:     5432,
+			Port:     portInt,
 			Database: databaseName,
 			User:     userName,
 			URL:      fmt.Sprintf("postgresql://%s@%s:%s/%s?sslmode=disable", userName, pgHost, pgPort, databaseName),

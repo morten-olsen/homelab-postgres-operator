@@ -20,10 +20,10 @@ import (
 	"context"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -53,7 +53,18 @@ var _ = Describe("PostgresCluster Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: postgresv1.PostgresClusterSpec{
+						Host: &postgresv1.StringOrSecret{
+							Value: "localhost",
+						},
+						Port: 5432,
+						User: &postgresv1.StringOrSecret{
+							Value: "postgres",
+						},
+						Password: &postgresv1.StringOrSecret{
+							Value: "testpassword",
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
@@ -69,51 +80,29 @@ var _ = Describe("PostgresCluster Controller", func() {
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 		})
 		It("should successfully reconcile the resource", func() {
+			By("Setting up a mock database connection")
+			db, mock, err := sqlmock.New()
+			Expect(err).NotTo(HaveOccurred())
+			defer func() {
+				_ = db.Close() // Ignore close error in test cleanup
+			}()
+
+			// Mock the PingContext call
+			mock.ExpectPing()
+
 			By("Reconciling the created resource")
 			controllerReconciler := &PostgresClusterReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
+				TestConnection: func(ctx context.Context, host string, port int, user, password string, log logr.Logger) (bool, string) {
+					// Use the mock database
+					if err := db.PingContext(ctx); err != nil {
+						return false, err.Error()
+					}
+					return true, "Successfully connected to PostgreSQL"
+				},
 			}
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Checking if the StatefulSet was created")
-			var statefulSet *appsv1.StatefulSet
-			Eventually(func() bool {
-				statefulSet = &appsv1.StatefulSet{}
-				err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-statefulset", Namespace: "default"}, statefulSet)
-				return err == nil
-			}, time.Second*10, time.Millisecond*250).Should(BeTrue())
-
-			By("Updating StatefulSet status to have ready replicas")
-			replicas := int32(1)
-			statefulSet.Status.ReadyReplicas = replicas
-			statefulSet.Status.Replicas = replicas
-			Expect(k8sClient.Status().Update(ctx, statefulSet)).To(Succeed())
-
-			By("Checking if the Service was created")
-			Eventually(func() bool {
-				service := &corev1.Service{}
-				err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-service", Namespace: "default"}, service)
-				return err == nil
-			}, time.Second*10, time.Millisecond*250).Should(BeTrue())
-
-			By("Checking if the admin Secret was created")
-			Eventually(func() bool {
-				secret := &corev1.Secret{}
-				err := k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-admin-secret", Namespace: "default"}, secret)
-				if err != nil {
-					return false
-				}
-				// Check for password key
-				_, ok := secret.Data["password"]
-				return ok
-			}, time.Second*10, time.Millisecond*250).Should(BeTrue())
-
-			By("Reconciling again to update status with ready StatefulSet")
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
@@ -128,6 +117,8 @@ var _ = Describe("PostgresCluster Controller", func() {
 				}
 				return updatedPostgresCluster.Status.AdminConnection != nil
 			}, time.Second*10, time.Millisecond*250).Should(BeTrue())
+
+			Expect(mock.ExpectationsWereMet()).Should(Succeed())
 		})
 	})
 })

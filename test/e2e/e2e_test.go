@@ -279,33 +279,148 @@ var _ = Describe("Manager", Ordered, func() {
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
 		It("should create a PostgresCluster and a PostgresDatabase", func() {
-			By("creating a PostgresCluster resource")
 			const clusterName = "e2e-test-cluster"
 			const dbName = "e2e-test-db"
 			const userName = "e2e-test-user"
 			const dbResourceName = "e2e-test-database"
+			const postgresServerName = "e2e-postgres-server"
+			const postgresPassword = "e2e-test-password"
 
+			By("deploying a PostgreSQL server for testing")
+			// Create a secret for PostgreSQL password
+			secret := fmt.Sprintf(`
+apiVersion: v1
+kind: Secret
+metadata:
+  name: %s-secret
+  namespace: %s
+type: Opaque
+stringData:
+  password: %s
+`, postgresServerName, namespace, postgresPassword)
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(secret)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create PostgreSQL secret")
+
+			// Deploy PostgreSQL StatefulSet
+			postgresStatefulSet := fmt.Sprintf(`
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  serviceName: %s
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+      name: %s
+  template:
+    metadata:
+      labels:
+        app: postgres
+        name: %s
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: postgres
+        image: postgres:16
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+        ports:
+        - containerPort: 5432
+          name: postgres
+        env:
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: %s-secret
+              key: password
+        - name: POSTGRES_DB
+          value: postgres
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 1Gi
+`, postgresServerName, namespace, postgresServerName, postgresServerName, postgresServerName, postgresServerName)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(postgresStatefulSet)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create PostgreSQL StatefulSet")
+
+			// Create Service for PostgreSQL
+			postgresService := fmt.Sprintf(`
+apiVersion: v1
+kind: Service
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  selector:
+    app: postgres
+    name: %s
+  ports:
+  - port: 5432
+    targetPort: 5432
+    name: postgres
+  clusterIP: None
+`, postgresServerName, namespace, postgresServerName)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(postgresService)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create PostgreSQL Service")
+
+			By("waiting for PostgreSQL server to be ready")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "statefulset", postgresServerName, "-n", namespace, "-o", "jsonpath={.status.readyReplicas}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("1"), "PostgreSQL StatefulSet should have 1 ready replica")
+			}, "5m", "5s").Should(Succeed())
+
+			By("creating a PostgresCluster resource with connection details")
 			cluster := fmt.Sprintf(`
 apiVersion: postgres.homelab.mortenolsen.pro/v1
 kind: PostgresCluster
 metadata:
   name: %s
   namespace: %s
-spec: {}
-`, clusterName, namespace)
-			cmd := exec.Command("kubectl", "apply", "-f", "-")
+spec:
+  host:
+    value: %s.%s.svc.cluster.local
+  port: 5432
+  user:
+    value: postgres
+  password:
+    valueFrom:
+      name: %s-secret
+      key: password
+`, clusterName, namespace, postgresServerName, namespace, postgresServerName)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cluster)
-			_, err := utils.Run(cmd)
+			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("waiting for the PostgresCluster to be Ready")
@@ -458,6 +573,14 @@ spec:
 			Expect(string(secretData["user"])).To(Equal(userName))
 			Expect(dbStatus.Connection.Database).To(Equal(dbName))
 			Expect(dbStatus.Connection.User).To(Equal(userName))
+
+			By("cleaning up PostgreSQL server resources")
+			cmd = exec.Command("kubectl", "delete", "statefulset", postgresServerName, "-n", namespace, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+			cmd = exec.Command("kubectl", "delete", "service", postgresServerName, "-n", namespace, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+			cmd = exec.Command("kubectl", "delete", "secret", fmt.Sprintf("%s-secret", postgresServerName), "-n", namespace, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
 		})
 	})
 })

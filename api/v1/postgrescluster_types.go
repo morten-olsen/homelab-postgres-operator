@@ -30,10 +30,53 @@ type PostgresClusterSpec struct {
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
-	// image is the container image to use for the cluster.
-	// +kubebuilder:default:="pgvector/pgvector:pg18"
+	// host is the hostname or IP address of the PostgreSQL server.
+	// Either host or hostFrom must be specified.
 	// +optional
-	Image string `json:"image,omitempty"`
+	Host *StringOrSecret `json:"host,omitempty"`
+
+	// port is the port number of the PostgreSQL server.
+	// Defaults to 5432 if not specified.
+	// +kubebuilder:default:=5432
+	// +optional
+	Port int `json:"port,omitempty"`
+
+	// user is the username for connecting to the PostgreSQL server.
+	// Either user or userFrom must be specified.
+	// +optional
+	User *StringOrSecret `json:"user,omitempty"`
+
+	// password is the password for connecting to the PostgreSQL server.
+	// Either password or passwordFrom must be specified.
+	// +optional
+	Password *StringOrSecret `json:"password,omitempty"`
+}
+
+// StringOrSecret represents a value that can either be a literal string or a reference to a secret.
+// Exactly one of Value or ValueFrom must be specified.
+type StringOrSecret struct {
+	// value is a literal string value.
+	// +optional
+	Value string `json:"value,omitempty"`
+
+	// valueFrom is a reference to a secret key.
+	// +optional
+	ValueFrom *SecretKeySelector `json:"valueFrom,omitempty"`
+}
+
+// SecretKeySelector selects a key from a secret.
+type SecretKeySelector struct {
+	// name is the name of the secret in the same namespace as the PostgresCluster.
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// key is the key in the secret to select.
+	// +kubebuilder:validation:Required
+	Key string `json:"key"`
+
+	// namespace is the namespace of the secret. If not specified, defaults to the PostgresCluster namespace.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // PostgresClusterStatus defines the observed state of PostgresCluster.

@@ -18,45 +18,42 @@ package controller
 
 import (
 	"context"
-	"fmt" // Import fmt for string formatting
+	"database/sql"
+	"fmt"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1" // Import for appsv1.StatefulSet
-	corev1 "k8s.io/api/core/v1" // Import for corev1.Secret
+	_ "github.com/lib/pq" // PostgreSQL driver
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource" // Import for resource.MustParse
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types" // Import for types.NamespacedName
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil" // Import for controllerutil.SetControllerReference
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/go-logr/logr"
 	postgresv1 "github.com/morten-olsen/homelab-postgres-operator/api/v1"
+)
+
+const (
+	connectionSuccessMessage = "Successfully connected to PostgreSQL"
 )
 
 // PostgresClusterReconciler reconciles a PostgresCluster object
 type PostgresClusterReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme         *runtime.Scheme
+	TestConnection func(ctx context.Context, host string, port int, user, password string, log logr.Logger) (bool, string)
 }
 
 // +kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=postgres.homelab.mortenolsen.pro,resources=postgresclusters/finalizers,verbs=update
-// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the PostgresCluster object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.4/pkg/reconcile
 func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -72,334 +69,183 @@ func (r *PostgresClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
-	// Manage the administrative secret
-	adminSecretName := fmt.Sprintf("%s-admin-secret", postgresCluster.Name)
-	adminSecret := &corev1.Secret{}
-	password := ""
-
-	err = r.Get(ctx, types.NamespacedName{Name: adminSecretName, Namespace: postgresCluster.Namespace}, adminSecret)
-	if err != nil && errors.IsNotFound(err) {
-		log.Info("Creating admin secret", "Secret.Namespace", postgresCluster.Namespace, "Secret.Name", adminSecretName)
-
-		generatedPassword, err := generateRandomPassword(32)
-		if err != nil {
-			log.Error(err, "Failed to generate random password")
-			return ctrl.Result{}, err
-		}
-		password = generatedPassword
-
-		adminSecret = &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      adminSecretName,
-				Namespace: postgresCluster.Namespace,
-			},
-			Data: map[string][]byte{
-				"password": []byte(password),
-			},
-		}
-
-		if err := controllerutil.SetControllerReference(postgresCluster, adminSecret, r.Scheme); err != nil {
-			log.Error(err, "Failed to set controller reference for admin secret")
-			return ctrl.Result{}, err
-		}
-
-		if err := r.Create(ctx, adminSecret); err != nil {
-			log.Error(err, "Failed to create admin secret")
-			return ctrl.Result{}, err
-		}
-		log.Info("Admin secret created successfully")
-	} else if err != nil {
-		log.Error(err, "Failed to get admin secret")
+	// Resolve connection details from spec
+	host, result, err := r.resolveStringOrSecret(ctx, postgresCluster, postgresCluster.Spec.Host, "host", log)
+	if result != nil {
+		return *result, err
+	}
+	if err != nil {
 		return ctrl.Result{}, err
-	} else {
-		// Secret already exists
-		log.Info("Admin secret already exists", "Secret.Namespace", postgresCluster.Namespace, "Secret.Name", adminSecretName)
 	}
 
-	// Define labels for the StatefulSet and Service
-	labels := map[string]string{
-		"app":        "postgres",
-		"postgrescr": postgresCluster.Name,
+	user, result, err := r.resolveStringOrSecret(ctx, postgresCluster, postgresCluster.Spec.User, "user", log)
+	if result != nil {
+		return *result, err
 	}
-
-	// Manage the StatefulSet for PostgreSQL
-	statefulSetName := fmt.Sprintf("%s-statefulset", postgresCluster.Name)
-	statefulSet := &appsv1.StatefulSet{}
-
-	err = r.Get(ctx, types.NamespacedName{Name: statefulSetName, Namespace: postgresCluster.Namespace}, statefulSet)
-	if err != nil && errors.IsNotFound(err) {
-		log.Info("Creating StatefulSet", "StatefulSet.Namespace", postgresCluster.Namespace, "StatefulSet.Name", statefulSetName)
-
-		statefulSet = &appsv1.StatefulSet{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      statefulSetName,
-				Namespace: postgresCluster.Namespace,
-				Labels:    labels,
-			},
-			Spec: appsv1.StatefulSetSpec{
-				Selector: &metav1.LabelSelector{
-					MatchLabels: labels,
-				},
-				ServiceName: fmt.Sprintf("%s-service", postgresCluster.Name), // Headless service name
-				Replicas:    func(i int32) *int32 { return &i }(1),           // Single replica for now
-				Template: corev1.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Labels: labels,
-					},
-					Spec: corev1.PodSpec{
-						SecurityContext: &corev1.PodSecurityContext{
-							RunAsNonRoot: func(b bool) *bool { return &b }(true),
-							RunAsUser:    func(i int64) *int64 { return &i }(999), // Set at pod level to ensure volume ownership
-							FSGroup:      func(i int64) *int64 { return &i }(999), // Ensure volumes are owned by GID 999
-							SeccompProfile: &corev1.SeccompProfile{
-								Type: corev1.SeccompProfileTypeRuntimeDefault,
-							},
-						},
-						InitContainers: []corev1.Container{
-							{
-								Name:  "init-data-dir",
-								Image: "busybox:1.36",
-								SecurityContext: &corev1.SecurityContext{
-									AllowPrivilegeEscalation: func(b bool) *bool { return &b }(false),
-									Capabilities: &corev1.Capabilities{
-										Drop: []corev1.Capability{"ALL"},
-									},
-									RunAsNonRoot: func(b bool) *bool { return &b }(true),
-									SeccompProfile: &corev1.SeccompProfile{
-										Type: corev1.SeccompProfileTypeRuntimeDefault,
-									},
-								},
-								Command: []string{"sh", "-c", `
-									# Ensure the PostgreSQL directory exists (PostgreSQL 18+ will create version-specific subdirectory)
-									# If directory doesn't exist, create it (will be owned by 999:999 due to RunAsUser and FSGroup)
-									if [ ! -d /var/lib/postgresql ]; then
-										mkdir -p /var/lib/postgresql
-									fi
-									# Ensure we can write to it (should already be writable due to fsGroup)
-									touch /var/lib/postgresql/.init-ready 2>/dev/null || true
-									rm -f /var/lib/postgresql/.init-ready 2>/dev/null || true
-								`},
-								VolumeMounts: []corev1.VolumeMount{
-									{
-										Name:      "data",
-										MountPath: "/var/lib/postgresql",
-									},
-								},
-							},
-						},
-						Containers: []corev1.Container{
-							{
-								Name:  "postgres",
-								Image: postgresCluster.Spec.Image,
-								SecurityContext: &corev1.SecurityContext{
-									AllowPrivilegeEscalation: func(b bool) *bool { return &b }(false),
-									Capabilities: &corev1.Capabilities{
-										Drop: []corev1.Capability{"ALL"},
-									},
-									RunAsNonRoot: func(b bool) *bool { return &b }(true),
-									SeccompProfile: &corev1.SeccompProfile{
-										Type: corev1.SeccompProfileTypeRuntimeDefault,
-									},
-								},
-								Ports: []corev1.ContainerPort{
-									{
-										ContainerPort: 5432,
-										Name:          "postgres",
-									},
-								},
-								Env: []corev1.EnvVar{
-									{
-										Name:  "POSTGRES_USER",
-										Value: "postgres",
-									},
-									{
-										Name: "POSTGRES_PASSWORD",
-										ValueFrom: &corev1.EnvVarSource{
-											SecretKeyRef: &corev1.SecretKeySelector{
-												LocalObjectReference: corev1.LocalObjectReference{
-													Name: adminSecretName,
-												},
-												Key: "password",
-											},
-										},
-									},
-									{
-										Name:  "POSTGRES_DB",
-										Value: "postgres",
-									},
-								},
-								VolumeMounts: []corev1.VolumeMount{
-									{
-										Name:      "data",
-										MountPath: "/var/lib/postgresql",
-									},
-								},
-							},
-						},
-					},
-				},
-				VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Name: "data",
-						},
-						Spec: corev1.PersistentVolumeClaimSpec{
-							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-							Resources: corev1.VolumeResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceStorage: resource.MustParse("1Gi"),
-								},
-							},
-						},
-					},
-				},
-			},
-		}
-
-		if err := controllerutil.SetControllerReference(postgresCluster, statefulSet, r.Scheme); err != nil {
-			log.Error(err, "Failed to set controller reference for StatefulSet")
-			return ctrl.Result{}, err
-		}
-
-		if err := r.Create(ctx, statefulSet); err != nil {
-			log.Error(err, "Failed to create StatefulSet")
-			return ctrl.Result{}, err
-		}
-		log.Info("StatefulSet created successfully")
-	} else if err != nil {
-		log.Error(err, "Failed to get StatefulSet")
+	if err != nil {
 		return ctrl.Result{}, err
-	} else {
-		// StatefulSet already exists, check for updates (e.g., image change)
-		log.Info("StatefulSet already exists", "StatefulSet.Namespace", postgresCluster.Namespace, "StatefulSet.Name", statefulSetName)
-		// TODO: Implement update logic here if needed
 	}
 
-	// Manage the Service for PostgreSQL
-	serviceName := fmt.Sprintf("%s-service", postgresCluster.Name)
-	service := &corev1.Service{}
-
-	err = r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: postgresCluster.Namespace}, service)
-	if err != nil && errors.IsNotFound(err) {
-		log.Info("Creating Service", "Service.Namespace", postgresCluster.Namespace, "Service.Name", serviceName)
-
-		service = &corev1.Service{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      serviceName,
-				Namespace: postgresCluster.Namespace,
-				Labels:    labels,
-			},
-			Spec: corev1.ServiceSpec{
-				Selector: labels,
-				Ports: []corev1.ServicePort{
-					{
-						Port: 5432,
-						Name: "postgres",
-					},
-				},
-				ClusterIP: corev1.ClusterIPNone, // Headless service
-			},
-		}
-
-		if err := controllerutil.SetControllerReference(postgresCluster, service, r.Scheme); err != nil {
-			log.Error(err, "Failed to set controller reference for Service")
-			return ctrl.Result{}, err
-		}
-
-		if err := r.Create(ctx, service); err != nil {
-			log.Error(err, "Failed to create Service")
-			return ctrl.Result{}, err
-		}
-		log.Info("Service created successfully")
-	} else if err != nil {
-		log.Error(err, "Failed to get Service")
+	password, result, err := r.resolveStringOrSecret(ctx, postgresCluster, postgresCluster.Spec.Password, "password", log)
+	if result != nil {
+		return *result, err
+	}
+	if err != nil {
 		return ctrl.Result{}, err
-	} else {
-		log.Info("Service already exists", "Service.Namespace", postgresCluster.Namespace, "Service.Name", serviceName)
-		// TODO: Implement update logic here if needed
 	}
 
-	// Refetch StatefulSet to get latest status before updating PostgresCluster status
-	statefulSetForStatus := &appsv1.StatefulSet{}
-	err = r.Get(ctx, types.NamespacedName{Name: statefulSetName, Namespace: postgresCluster.Namespace}, statefulSetForStatus)
-	if err != nil && !errors.IsNotFound(err) {
-		log.Error(err, "Failed to get StatefulSet for status update")
-		// Continue with nil StatefulSet for status update
-		statefulSetForStatus = nil
-	} else if errors.IsNotFound(err) {
-		statefulSetForStatus = nil
+	port := postgresCluster.Spec.Port
+	if port == 0 {
+		port = 5432
 	}
 
-	// Refetch Service to get latest status
-	serviceForStatus := &corev1.Service{}
-	err = r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: postgresCluster.Namespace}, serviceForStatus)
-	if err != nil && !errors.IsNotFound(err) {
-		log.Error(err, "Failed to get Service for status update")
-		serviceForStatus = nil
-	} else if errors.IsNotFound(err) {
-		serviceForStatus = nil
+	// Validate that all required fields are present
+	if host == "" {
+		r.setCondition(postgresCluster, "ConfigurationValid", false, "host is required")
+		r.updatePhase(postgresCluster)
+		if updateErr := r.Status().Update(ctx, postgresCluster); updateErr != nil {
+			log.Error(updateErr, "Failed to update status")
+		}
+		return ctrl.Result{}, fmt.Errorf("host is required")
 	}
+	if user == "" {
+		r.setCondition(postgresCluster, "ConfigurationValid", false, "user is required")
+		r.updatePhase(postgresCluster)
+		if updateErr := r.Status().Update(ctx, postgresCluster); updateErr != nil {
+			log.Error(updateErr, "Failed to update status")
+		}
+		return ctrl.Result{}, fmt.Errorf("user is required")
+	}
+	if password == "" {
+		r.setCondition(postgresCluster, "ConfigurationValid", false, "password is required")
+		r.updatePhase(postgresCluster)
+		if updateErr := r.Status().Update(ctx, postgresCluster); updateErr != nil {
+			log.Error(updateErr, "Failed to update status")
+		}
+		return ctrl.Result{}, fmt.Errorf("password is required")
+	}
+
+	// Test connection to PostgreSQL
+	testConnFunc := r.TestConnection
+	if testConnFunc == nil {
+		testConnFunc = r.testConnection
+	}
+	connectionReady, connectionMessage := testConnFunc(ctx, host, port, user, password, log)
+
+	// Update status
+	r.setCondition(postgresCluster, "ConfigurationValid", true, "Configuration is valid")
+	r.setCondition(postgresCluster, "ConnectionReady", connectionReady, connectionMessage)
 
 	// Update PostgresCluster status
-	if err := r.updateStatus(ctx, postgresCluster, statefulSetForStatus, serviceForStatus); err != nil {
+	if err := r.updateStatus(ctx, postgresCluster, host, port, user); err != nil {
 		log.Error(err, "Failed to update PostgresCluster status")
 		return ctrl.Result{}, err
 	}
 
 	log.Info("PostgresCluster status updated successfully", "PostgresCluster.Name", postgresCluster.Name)
 
-	return ctrl.Result{}, nil
+	// Requeue if connection is not ready
+	if !connectionReady {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
 
+	return ctrl.Result{}, nil
+}
+
+// resolveStringOrSecret resolves a StringOrSecret to its actual string value.
+// It returns the resolved value, a result (if requeue is needed), and an error.
+func (r *PostgresClusterReconciler) resolveStringOrSecret(ctx context.Context, postgresCluster *postgresv1.PostgresCluster, strOrSecret *postgresv1.StringOrSecret, fieldName string, log logr.Logger) (string, *ctrl.Result, error) {
+	if strOrSecret == nil {
+		return "", nil, fmt.Errorf("%s is required", fieldName)
+	}
+
+	// Check if it's a literal value
+	if strOrSecret.Value != "" {
+		return strOrSecret.Value, nil, nil
+	}
+
+	// Check if it's a secret reference
+	if strOrSecret.ValueFrom == nil {
+		return "", nil, fmt.Errorf("%s must specify either value or valueFrom", fieldName)
+	}
+
+	secretNamespace := postgresCluster.Namespace
+	if strOrSecret.ValueFrom.Namespace != "" {
+		secretNamespace = strOrSecret.ValueFrom.Namespace
+	}
+
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: strOrSecret.ValueFrom.Name, Namespace: secretNamespace}, secret)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			log.Info("Secret not found, requeueing", "Secret.Name", strOrSecret.ValueFrom.Name, "Secret.Namespace", secretNamespace, "Field", fieldName)
+			return "", &ctrl.Result{Requeue: true}, nil
+		}
+		return "", nil, fmt.Errorf("failed to get secret %s/%s: %w", secretNamespace, strOrSecret.ValueFrom.Name, err)
+	}
+
+	value, exists := secret.Data[strOrSecret.ValueFrom.Key]
+	if !exists {
+		return "", nil, fmt.Errorf("key %s not found in secret %s/%s", strOrSecret.ValueFrom.Key, secretNamespace, strOrSecret.ValueFrom.Name)
+	}
+
+	return string(value), nil, nil
+}
+
+// testConnection tests the connection to PostgreSQL.
+func (r *PostgresClusterReconciler) testConnection(ctx context.Context, host string, port int, user, password string, log logr.Logger) (bool, string) {
+	connStr := fmt.Sprintf("host=%s port=%d user=%s password=%s sslmode=disable dbname=postgres", host, port, user, password)
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return false, fmt.Sprintf("Failed to open database connection: %v", err)
+	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			log.Error(closeErr, "Failed to close database connection")
+		}
+	}()
+
+	if err := db.PingContext(ctx); err != nil {
+		return false, fmt.Sprintf("Failed to connect to PostgreSQL: %v", err)
+	}
+
+	return true, connectionSuccessMessage
 }
 
 // updateStatus updates the PostgresCluster status with conditions, phase, and connection info.
-func (r *PostgresClusterReconciler) updateStatus(ctx context.Context, postgresCluster *postgresv1.PostgresCluster, statefulSet *appsv1.StatefulSet, service *corev1.Service) error {
+func (r *PostgresClusterReconciler) updateStatus(ctx context.Context, postgresCluster *postgresv1.PostgresCluster, host string, port int, user string) error {
 	// Set observed generation
 	postgresCluster.Status.ObservedGeneration = postgresCluster.Generation
 
-	// Check StatefulSet status
-	statefulSetReady := false
-	var statefulSetMessage string
-	if statefulSet != nil {
-		if statefulSet.Status.ReadyReplicas == *statefulSet.Spec.Replicas && *statefulSet.Spec.Replicas > 0 {
-			statefulSetReady = true
-			statefulSetMessage = "StatefulSet is ready"
-		} else {
-			statefulSetMessage = fmt.Sprintf("StatefulSet has %d/%d ready replicas", statefulSet.Status.ReadyReplicas, *statefulSet.Spec.Replicas)
-		}
-	} else {
-		statefulSetMessage = "StatefulSet does not exist"
-	}
-
-	// Check Service status
-	serviceReady := service != nil
-	serviceMessage := "Service is ready"
-	if !serviceReady {
-		serviceMessage = "Service does not exist"
-	}
-
-	// Update conditions
-	r.setCondition(postgresCluster, "StatefulSetReady", statefulSetReady, statefulSetMessage)
-	r.setCondition(postgresCluster, "ServiceReady", serviceReady, serviceMessage)
+	// Get condition statuses
+	configValid := r.getConditionStatus(postgresCluster, "ConfigurationValid")
+	connectionReady := r.getConditionStatus(postgresCluster, "ConnectionReady")
 
 	// Determine overall Ready condition
-	overallReady := statefulSetReady && serviceReady
+	overallReady := configValid && connectionReady
 	overallMessage := "PostgresCluster is ready"
 	if !overallReady {
-		overallMessage = fmt.Sprintf("StatefulSet ready: %v, Service ready: %v", statefulSetReady, serviceReady)
+		var reasons []string
+		if !configValid {
+			reasons = append(reasons, "configuration invalid")
+		}
+		if !connectionReady {
+			reasons = append(reasons, "connection not ready")
+		}
+		overallMessage = fmt.Sprintf("PostgresCluster not ready: %s", fmt.Sprint(reasons))
 	}
 	r.setCondition(postgresCluster, "Ready", overallReady, overallMessage)
 
 	// Update phase based on conditions
-	r.updatePhase(postgresCluster, statefulSet)
+	r.updatePhase(postgresCluster)
 
 	// Update admin connection (without password for security)
 	if overallReady {
 		postgresCluster.Status.AdminConnection = &postgresv1.PostgresClusterAdminConnection{
-			Host: fmt.Sprintf("%s-service", postgresCluster.Name),
-			Port: 5432,
-			User: "postgres",
-			URL:  fmt.Sprintf("postgresql://postgres@%s-service:5432/postgres", postgresCluster.Name),
+			Host: host,
+			Port: port,
+			User: user,
+			URL:  fmt.Sprintf("postgresql://%s@%s:%d/postgres", user, host, port),
 		}
 	}
 
@@ -445,7 +291,7 @@ func (r *PostgresClusterReconciler) setCondition(postgresCluster *postgresv1.Pos
 }
 
 // updatePhase updates the phase based on the current conditions.
-func (r *PostgresClusterReconciler) updatePhase(postgresCluster *postgresv1.PostgresCluster, statefulSet *appsv1.StatefulSet) {
+func (r *PostgresClusterReconciler) updatePhase(postgresCluster *postgresv1.PostgresCluster) {
 	// Check if being deleted
 	if !postgresCluster.DeletionTimestamp.IsZero() {
 		postgresCluster.Status.Phase = postgresv1.PostgresClusterPhaseDeleting
@@ -464,14 +310,12 @@ func (r *PostgresClusterReconciler) updatePhase(postgresCluster *postgresv1.Post
 		postgresCluster.Status.Phase = postgresv1.PostgresClusterPhaseReady
 	case metav1.ConditionFalse:
 		// Check if there's a failure condition
-		statefulSetCondition := r.getCondition(postgresCluster, "StatefulSetReady")
-		if statefulSetCondition != nil && statefulSetCondition.Status == metav1.ConditionFalse {
-			// Check if StatefulSet exists
-			if statefulSet == nil || statefulSetCondition.Message == "StatefulSet does not exist" {
-				postgresCluster.Status.Phase = postgresv1.PostgresClusterPhaseCreating
-			} else {
-				postgresCluster.Status.Phase = postgresv1.PostgresClusterPhaseFailed
-			}
+		configCondition := r.getCondition(postgresCluster, "ConfigurationValid")
+		connectionCondition := r.getCondition(postgresCluster, "ConnectionReady")
+		if configCondition != nil && configCondition.Status == metav1.ConditionFalse {
+			postgresCluster.Status.Phase = postgresv1.PostgresClusterPhaseFailed
+		} else if connectionCondition != nil && connectionCondition.Status == metav1.ConditionFalse {
+			postgresCluster.Status.Phase = postgresv1.PostgresClusterPhaseCreating
 		} else {
 			postgresCluster.Status.Phase = postgresv1.PostgresClusterPhaseCreating
 		}
@@ -490,12 +334,16 @@ func (r *PostgresClusterReconciler) getCondition(postgresCluster *postgresv1.Pos
 	return nil
 }
 
+// getConditionStatus returns true if the condition exists and is True, false otherwise.
+func (r *PostgresClusterReconciler) getConditionStatus(postgresCluster *postgresv1.PostgresCluster, conditionType string) bool {
+	condition := r.getCondition(postgresCluster, conditionType)
+	return condition != nil && condition.Status == metav1.ConditionTrue
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *PostgresClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&postgresv1.PostgresCluster{}).
-		Owns(&appsv1.StatefulSet{}).
-		Owns(&corev1.Service{}).
 		Named("postgrescluster").
 		Complete(r)
 }
