@@ -157,6 +157,14 @@ var _ = Describe("PostgresDatabase Controller", func() {
 			mock.ExpectExec(fmt.Sprintf(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO "%s";`, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
 			mock.ExpectExec(fmt.Sprintf(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO "%s";`, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
 			mock.ExpectExec(fmt.Sprintf(`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO "%s";`, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
+			// Ownership transfer queries for existing objects
+			mock.ExpectExec(`DO \$\$`).WillReturnResult(sqlmock.NewResult(1, 1)) // Transfer table ownership
+			mock.ExpectExec(`DO \$\$`).WillReturnResult(sqlmock.NewResult(1, 1)) // Transfer sequence ownership
+			mock.ExpectExec(`DO \$\$`).WillReturnResult(sqlmock.NewResult(1, 1)) // Transfer view ownership
+			mock.ExpectExec(`DO \$\$`).WillReturnResult(sqlmock.NewResult(1, 1)) // Transfer materialized view ownership
+			mock.ExpectExec(`DO \$\$`).WillReturnResult(sqlmock.NewResult(1, 1)) // Transfer function ownership
+			mock.ExpectExec(`DO \$\$`).WillReturnResult(sqlmock.NewResult(1, 1)) // Transfer type ownership
+			mock.ExpectExec(`DO \$\$`).WillReturnResult(sqlmock.NewResult(1, 1)) // Transfer domain ownership
 
 			databaseReconciler := &PostgresDatabaseReconciler{
 				Client: k8sClient,

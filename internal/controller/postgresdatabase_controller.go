@@ -733,7 +733,138 @@ func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, 
 		// Non-critical, continue
 	}
 
-	log.Info("Database and user created successfully with full privileges")
+	// Transfer ownership of existing tables to the user
+	// This is critical for applications that need to modify table structures (migrations, etc.)
+	transferTableOwnershipQuery := fmt.Sprintf(`
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') LOOP
+        EXECUTE 'ALTER TABLE public.' || quote_ident(r.tablename) || ' OWNER TO %s;';
+    END LOOP;
+END $$;`, quotedUserName)
+	if _, err := targetDB.ExecContext(ctx, transferTableOwnershipQuery); err != nil {
+		log.Info("Failed to transfer table ownership (non-critical, may have no tables)", "error", err)
+		// Non-critical, continue - database might not have any tables yet
+	} else {
+		log.Info("Transferred ownership of existing tables to user", "user", userName)
+	}
+
+	// Transfer ownership of existing sequences to the user
+	transferSequenceOwnershipQuery := fmt.Sprintf(`
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (SELECT sequence_name FROM information_schema.sequences WHERE sequence_schema = 'public') LOOP
+        EXECUTE 'ALTER SEQUENCE public.' || quote_ident(r.sequence_name) || ' OWNER TO %s;';
+    END LOOP;
+END $$;`, quotedUserName)
+	if _, err := targetDB.ExecContext(ctx, transferSequenceOwnershipQuery); err != nil {
+		log.Info("Failed to transfer sequence ownership (non-critical, may have no sequences)", "error", err)
+		// Non-critical, continue - database might not have any sequences yet
+	} else {
+		log.Info("Transferred ownership of existing sequences to user", "user", userName)
+	}
+
+	// Transfer ownership of existing views to the user
+	transferViewOwnershipQuery := fmt.Sprintf(`
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (SELECT table_name FROM information_schema.views WHERE table_schema = 'public') LOOP
+        EXECUTE 'ALTER VIEW public.' || quote_ident(r.table_name) || ' OWNER TO %s;';
+    END LOOP;
+END $$;`, quotedUserName)
+	if _, err := targetDB.ExecContext(ctx, transferViewOwnershipQuery); err != nil {
+		log.Info("Failed to transfer view ownership (non-critical, may have no views)", "error", err)
+		// Non-critical, continue - database might not have any views yet
+	} else {
+		log.Info("Transferred ownership of existing views to user", "user", userName)
+	}
+
+	// Transfer ownership of existing materialized views to the user
+	transferMatViewOwnershipQuery := fmt.Sprintf(`
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (SELECT matviewname FROM pg_matviews WHERE schemaname = 'public') LOOP
+        EXECUTE 'ALTER MATERIALIZED VIEW public.' || quote_ident(r.matviewname) || ' OWNER TO %s;';
+    END LOOP;
+END $$;`, quotedUserName)
+	if _, err := targetDB.ExecContext(ctx, transferMatViewOwnershipQuery); err != nil {
+		log.Info("Failed to transfer materialized view ownership (non-critical, may have no materialized views)", "error", err)
+		// Non-critical, continue - database might not have any materialized views yet
+	} else {
+		log.Info("Transferred ownership of existing materialized views to user", "user", userName)
+	}
+
+	// Transfer ownership of existing functions to the user
+	transferFunctionOwnershipQuery := fmt.Sprintf(`
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (SELECT p.proname, pg_get_function_identity_arguments(p.oid) as args
+              FROM pg_proc p
+              JOIN pg_namespace n ON p.pronamespace = n.oid
+              WHERE n.nspname = 'public') LOOP
+        EXECUTE 'ALTER FUNCTION public.' || quote_ident(r.proname) || '(' || r.args || ') OWNER TO %s;';
+    END LOOP;
+END $$;`, quotedUserName)
+	if _, err := targetDB.ExecContext(ctx, transferFunctionOwnershipQuery); err != nil {
+		log.Info("Failed to transfer function ownership (non-critical, may have no functions)", "error", err)
+		// Non-critical, continue - database might not have any functions yet
+	} else {
+		log.Info("Transferred ownership of existing functions to user", "user", userName)
+	}
+
+	// Transfer ownership of existing types to the user
+	transferTypeOwnershipQuery := fmt.Sprintf(`
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (SELECT t.typname
+              FROM pg_type t
+              JOIN pg_namespace n ON t.typnamespace = n.oid
+              WHERE n.nspname = 'public'
+              AND t.typtype IN ('e', 'c', 'r', 'b')) LOOP
+        EXECUTE 'ALTER TYPE public.' || quote_ident(r.typname) || ' OWNER TO %s;';
+    END LOOP;
+END $$;`, quotedUserName)
+	if _, err := targetDB.ExecContext(ctx, transferTypeOwnershipQuery); err != nil {
+		log.Info("Failed to transfer type ownership (non-critical, may have no types)", "error", err)
+		// Non-critical, continue - database might not have any types yet
+	} else {
+		log.Info("Transferred ownership of existing types to user", "user", userName)
+	}
+
+	// Transfer ownership of existing domains to the user
+	transferDomainOwnershipQuery := fmt.Sprintf(`
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (SELECT t.typname
+              FROM pg_type t
+              JOIN pg_namespace n ON t.typnamespace = n.oid
+              WHERE n.nspname = 'public'
+              AND t.typtype = 'd') LOOP
+        EXECUTE 'ALTER DOMAIN public.' || quote_ident(r.typname) || ' OWNER TO %s;';
+    END LOOP;
+END $$;`, quotedUserName)
+	if _, err := targetDB.ExecContext(ctx, transferDomainOwnershipQuery); err != nil {
+		log.Info("Failed to transfer domain ownership (non-critical, may have no domains)", "error", err)
+		// Non-critical, continue - database might not have any domains yet
+	} else {
+		log.Info("Transferred ownership of existing domains to user", "user", userName)
+	}
+
+	log.Info("Database and user created successfully with full privileges and object ownership")
 	r.setCondition(postgresDatabase, "DatabaseReady", true, "Database and user created successfully")
 	return nil, nil
 }
