@@ -146,8 +146,9 @@ var _ = Describe("PostgresDatabase Controller", func() {
 			// Database name and username will be computed as {namespace}_{name} = "default_test-database"
 			expectedDBName := "default_test-database"
 			expectedUserName := "default_test-database"
-			mock.ExpectExec(fmt.Sprintf(`CREATE DATABASE "%s";`, expectedDBName)).WillReturnResult(sqlmock.NewResult(1, 1))
+			// User is created first, then database with user as owner
 			mock.ExpectExec(fmt.Sprintf(`CREATE USER "%s" WITH PASSWORD '.+';`, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
+			mock.ExpectExec(fmt.Sprintf(`CREATE DATABASE "%s" OWNER "%s";`, expectedDBName, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
 			mock.ExpectExec(fmt.Sprintf(`GRANT ALL PRIVILEGES ON DATABASE "%s" TO "%s";`, expectedDBName, expectedUserName)).WillReturnResult(sqlmock.NewResult(1, 1))
 			// Additional queries for schema privileges
 			mock.ExpectPing() // Ping when connecting to the target database

@@ -584,31 +584,15 @@ func (r *PostgresDatabaseReconciler) ensureConnectionSecret(ctx context.Context,
 func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, db *sql.DB, dbUserPassword string, pgHost, pgPort, adminUser, adminPassword string, log logr.Logger) (*ctrl.Result, error) {
 	databaseName := getDatabaseName(postgresDatabase)
 	userName := getUserName(postgresDatabase)
-
-	// Create database (must be executed outside of a transaction)
-	quotedDBName := quotePostgreSQLIdentifier(databaseName)
-	createDBQuery := fmt.Sprintf("CREATE DATABASE %s;", quotedDBName)
-	if _, err := db.ExecContext(ctx, createDBQuery); err != nil {
-		if !strings.Contains(err.Error(), "already exists") {
-			errMsg := fmt.Sprintf("Failed to create database: %v", err)
-			log.Error(err, "Failed to create database", "query", createDBQuery)
-			r.setCondition(postgresDatabase, "DatabaseReady", false, errMsg)
-			r.updatePhase(postgresDatabase)
-			if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
-				log.Error(updateErr, "Failed to update status")
-			}
-			return &ctrl.Result{}, err
-		}
-		log.Info("Database already exists", "database", databaseName)
-	}
-
-	// Create user and grant privileges
 	quotedUserName := quotePostgreSQLIdentifier(userName)
+	quotedDBName := quotePostgreSQLIdentifier(databaseName)
 	// Escape single quotes in password by doubling them
 	escapedPassword := strings.ReplaceAll(dbUserPassword, "'", "''")
 
-	// Create user (execute outside transaction to avoid abort issues)
+	// Create user first (before database) so we can set them as owner
+	// Execute outside transaction to avoid abort issues
 	createUserQuery := fmt.Sprintf("CREATE USER %s WITH PASSWORD '%s';", quotedUserName, escapedPassword)
+	userExists := false
 	if _, err := db.ExecContext(ctx, createUserQuery); err != nil {
 		if !strings.Contains(err.Error(), "already exists") {
 			errMsg := fmt.Sprintf("Failed to create user: %v", err)
@@ -621,11 +605,38 @@ func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, 
 			return &ctrl.Result{}, err
 		}
 		log.Info("User already exists, updating password if needed", "user", userName)
+		userExists = true
 		// User exists, update password to ensure it matches the secret
 		alterUserQuery := fmt.Sprintf("ALTER USER %s WITH PASSWORD '%s';", quotedUserName, escapedPassword)
 		if _, alterErr := db.ExecContext(ctx, alterUserQuery); alterErr != nil {
 			log.Info("Failed to update user password (non-critical, may already be correct)", "error", alterErr)
 			// Non-critical, continue - password might already be correct
+		}
+	}
+
+	// Create database with the user as owner (must be executed outside of a transaction)
+	createDBQuery := fmt.Sprintf("CREATE DATABASE %s OWNER %s;", quotedDBName, quotedUserName)
+	if _, err := db.ExecContext(ctx, createDBQuery); err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			errMsg := fmt.Sprintf("Failed to create database: %v", err)
+			log.Error(err, "Failed to create database", "query", createDBQuery)
+			r.setCondition(postgresDatabase, "DatabaseReady", false, errMsg)
+			r.updatePhase(postgresDatabase)
+			if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
+				log.Error(updateErr, "Failed to update status")
+			}
+			return &ctrl.Result{}, err
+		}
+		log.Info("Database already exists", "database", databaseName)
+		// If database exists and user existed, ensure user is the owner
+		if userExists {
+			alterDBOwnerQuery := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s;", quotedDBName, quotedUserName)
+			if _, alterErr := db.ExecContext(ctx, alterDBOwnerQuery); alterErr != nil {
+				log.Info("Failed to change database owner (non-critical, may already be correct)", "error", alterErr)
+				// Non-critical, continue - ownership might already be correct
+			} else {
+				log.Info("Changed database owner to user", "database", databaseName, "user", userName)
+			}
 		}
 	}
 
