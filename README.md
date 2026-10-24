@@ -60,6 +60,34 @@ spec:
   reclaimPolicy: Retain # Can be Retain or Delete
 ```
 
+## Ownership repair during reconciliation
+
+The operator repairs ownership of existing public tables, partitioned tables,
+sequences, views, materialized views, functions, standalone types and domains
+so the application role can run its own migrations. Correctly owned objects
+are skipped using the PostgreSQL catalogs; a normal reconcile must not take
+exclusive locks on application tables.
+
+Each object that needs repair is changed in a separate transaction with a
+two-second `lock_timeout`. The whole ownership repair has a 30-second context
+deadline. Failure rolls back the current transaction and returns an error to
+the controller for retry, rather than reporting the database as ready. Locks
+from earlier successful repairs are released before the next object is touched.
+The timeout is local to these transactions; application sessions are unchanged.
+
+The contention regression test requires a fresh, empty, disposable PostgreSQL
+database and a test superuser. It creates test objects and a test role; never
+point it at an application database:
+
+```sh
+OWNERSHIP_TEST_DSN='host=127.0.0.1 port=55432 user=test dbname=ownership sslmode=disable' \
+  go test ./internal/controller -run '^TestOwnershipRepair$' -count=1 -v
+```
+
+The test covers initial ownership repair, repeated reconciliation, an application
+holding a read lock on an already owned table, and lock timeout followed by retry
+for a table with the wrong owner. `make test` skips this test when the DSN is unset.
+
 ## Reclaim Policy
 
 The `reclaimPolicy` field in the `PostgresDatabase` spec controls what happens when a `PostgresDatabase` resource is deleted.
