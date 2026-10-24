@@ -20,12 +20,13 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	stderrors "errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
-	_ "github.com/lib/pq" // PostgreSQL driver
+	"github.com/lib/pq" // PostgreSQL driver
 	postgresv1 "github.com/morten-olsen/homelab-postgres-operator/api/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -580,6 +581,23 @@ func (r *PostgresDatabaseReconciler) ensureConnectionSecret(ctx context.Context,
 	return dbUserPassword, nil, nil
 }
 
+// passwordStatementError keeps credential SQL and driver diagnostics out of logs,
+// status conditions, and controller-runtime's returned-error logging. PostgreSQL
+// messages, details, and wrapped causes can echo the statement or password, so
+// retain only a validated SQLSTATE and the caller's fixed operation description.
+func passwordStatementError(operation string, err error) error {
+	var pgErr *pq.Error
+	if stderrors.As(err, &pgErr) {
+		code := string(pgErr.Code)
+		if len(code) == 5 && strings.IndexFunc(code, func(c rune) bool {
+			return (c < '0' || c > '9') && (c < 'A' || c > 'Z')
+		}) == -1 {
+			return fmt.Errorf("%s (SQLSTATE %s)", operation, code)
+		}
+	}
+	return fmt.Errorf("%s", operation)
+}
+
 // createDatabaseAndUser creates the database and user.
 func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, postgresDatabase *postgresv1.PostgresDatabase, db *sql.DB, dbUserPassword string, pgHost, pgPort, adminUser, adminPassword string, log logr.Logger) (*ctrl.Result, error) {
 	databaseName := getDatabaseName(postgresDatabase)
@@ -595,21 +613,21 @@ func (r *PostgresDatabaseReconciler) createDatabaseAndUser(ctx context.Context, 
 	userExists := false
 	if _, err := db.ExecContext(ctx, createUserQuery); err != nil {
 		if !strings.Contains(err.Error(), "already exists") {
-			errMsg := fmt.Sprintf("Failed to create user: %v", err)
-			log.Error(err, "Failed to create user", "query", createUserQuery)
-			r.setCondition(postgresDatabase, "DatabaseReady", false, errMsg)
+			safeErr := passwordStatementError("Failed to create user", err)
+			log.Error(safeErr, "Failed to create user", "user", userName)
+			r.setCondition(postgresDatabase, "DatabaseReady", false, safeErr.Error())
 			r.updatePhase(postgresDatabase)
 			if updateErr := r.Status().Update(ctx, postgresDatabase); updateErr != nil {
 				log.Error(updateErr, "Failed to update status")
 			}
-			return &ctrl.Result{}, err
+			return &ctrl.Result{}, safeErr
 		}
 		log.Info("User already exists, updating password if needed", "user", userName)
 		userExists = true
 		// User exists, update password to ensure it matches the secret
 		alterUserQuery := fmt.Sprintf("ALTER USER %s WITH PASSWORD '%s';", quotedUserName, escapedPassword)
 		if _, alterErr := db.ExecContext(ctx, alterUserQuery); alterErr != nil {
-			log.Info("Failed to update user password (non-critical, may already be correct)", "error", alterErr)
+			log.Info("Failed to update user password (non-critical, may already be correct)", "user", userName, "error", passwordStatementError("Failed to update user password", alterErr))
 			// Non-critical, continue - password might already be correct
 		}
 	}
