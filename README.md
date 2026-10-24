@@ -95,3 +95,10 @@ The `reclaimPolicy` field in the `PostgresDatabase` spec controls what happens w
 -   **`Retain` (default):** When the `PostgresDatabase` resource is deleted, the underlying database and user in PostgreSQL are **not** removed. This is a safety measure to prevent accidental data loss. The connection secret is also retained.
 
 -   **`Delete`:** When the `PostgresDatabase` resource is deleted, the underlying database and user in PostgreSQL are **deleted**. Use this with caution. The connection secret is also deleted.
+
+## End-to-end PostgreSQL fixture
+
+`make test-e2e` runs in an isolated Kind cluster. The non-root PostgreSQL fixture
+uses a `pgdata` child directory inside its PVC: UID 999 can create and own that
+directory without trying to chmod the root-owned mount point. A `pg_isready`
+readiness probe gates the connection and database reconciliation checks.

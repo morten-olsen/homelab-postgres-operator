@@ -353,6 +353,13 @@ spec:
               key: password
         - name: POSTGRES_DB
           value: postgres
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "postgres"]
+          periodSeconds: 2
+          timeoutSeconds: 2
         volumeMounts:
         - name: data
           mountPath: /var/lib/postgresql/data
