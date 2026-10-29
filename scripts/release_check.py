@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -87,7 +88,7 @@ def published_versions(operator):
 
 def exists(url, headers=None):
     try:
-        with urlopen(Request(url, headers=headers or {}), timeout=30):
+        with urlopen(Request(url, headers={"Cache-Control": "no-cache", **(headers or {})}), timeout=30):
             return True
     except HTTPError as error:
         if error.code == 404:
@@ -106,17 +107,29 @@ def image_exists(operator, value):
     })
 
 
+def require_visible(lookup, message):
+    # A successful prior job may precede anonymous registry/API visibility.
+    # Only 404 returns False. Permission, rate-limit and transport errors still fail closed.
+    for delay in (0, 2, 5, 10, 15, 25):
+        if delay:
+            print(f"{message}; confirming with a read-only lookup in {delay}s", file=sys.stderr)
+            time.sleep(delay)
+        if lookup():
+            return
+    raise ValueError(message)
+
+
 def check_artifacts(operator, tag, stage="image"):
-    image = image_exists(operator, tag[1:])
-    if stage == "image" and image:
-        raise ValueError("Image version already exists; partial publication requires an explicit recovery decision")
-    if stage != "image" and not image:
-        raise ValueError("Prior image publication is missing")
-    metadata = exists(f"https://api.github.com/repos/morten-olsen/homelab-{operator}/releases/tags/{tag}")
-    if stage != "pages" and metadata:
+    if stage == "image":
+        if image_exists(operator, tag[1:]):
+            raise ValueError("Image version already exists; partial publication requires an explicit recovery decision")
+    else:
+        require_visible(lambda: image_exists(operator, tag[1:]), "Prior image publication is missing")
+    metadata = f"https://api.github.com/repos/morten-olsen/homelab-{operator}/releases/tags/{tag}"
+    if stage == "pages":
+        require_visible(lambda: exists(metadata), "Prior release publication is missing")
+    elif exists(metadata):
         raise ValueError("Release already exists; do not overwrite it")
-    if stage == "pages" and not metadata:
-        raise ValueError("Prior release publication is missing")
 
 
 def workflow_release(event, operator):

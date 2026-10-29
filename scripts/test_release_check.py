@@ -16,6 +16,38 @@ OTHER = "b" * 40
 
 
 class ReleaseCheckTests(unittest.TestCase):
+    def setUp(self):
+        pause = patch("time.sleep")
+        self.pause = pause.start()
+        self.addCleanup(pause.stop)
+
+    def test_prior_release_visibility_can_arrive_after_creation(self):
+        with patch.object(release, "image_exists", return_value=True), patch.object(release, "exists", side_effect=[False, False, True]) as metadata:
+            release.check_artifacts("postgres-operator", "v0.0.22", "pages")
+        self.assertEqual(metadata.call_count, 3)
+        self.assertEqual([call.args[0] for call in self.pause.call_args_list], [2, 5])
+
+    def test_missing_prior_stage_stops_after_bounded_read_only_confirmation(self):
+        with patch.object(release, "image_exists", return_value=True), patch.object(release, "exists", return_value=False) as metadata:
+            with self.assertRaisesRegex(ValueError, "missing"):
+                release.check_artifacts("postgres-operator", "v0.0.22", "pages")
+        self.assertEqual(metadata.call_count, 6)
+        self.assertEqual(sum(call.args[0] for call in self.pause.call_args_list), 57)
+
+    def test_permission_errors_are_never_retried_or_treated_as_absence(self):
+        error = HTTPError("https://example.invalid", 403, "forbidden", {}, None)
+        with patch.object(release, "image_exists", return_value=True), patch.object(release, "exists", side_effect=error) as metadata:
+            with self.assertRaises(HTTPError):
+                release.check_artifacts("postgres-operator", "v0.0.22", "pages")
+        self.assertEqual(metadata.call_count, 1)
+        self.pause.assert_not_called()
+
+    def test_existing_artifacts_are_refused_without_any_retry(self):
+        with patch.object(release, "image_exists", return_value=True):
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                release.check_artifacts("postgres-operator", "v0.0.22", "image")
+        self.pause.assert_not_called()
+
     def test_workflow_handoff_rejects_untrusted_or_non_release_events(self):
         repository = "morten-olsen/homelab-postgres-operator"
         event = {
