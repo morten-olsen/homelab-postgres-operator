@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only release preflight. Tags are created only in Forgejo, after approval."""
+"""Read-only release preflight; tags originate in Forgejo and publishers read its outward mirror."""
 
 import argparse
 import json
@@ -30,15 +30,38 @@ def check_source(refs, tag, commit, require_tag):
     ref = f"refs/tags/{tag}"
     actual = refs.get(ref + "^{}", refs.get(ref))
     if actual is None and require_tag:
-        raise ValueError(f"{tag} is absent from Forgejo")
+        raise ValueError(f"{tag} is absent from the release source")
     if actual is not None and actual != commit:
-        raise ValueError(f"{tag} points to a different commit in Forgejo")
+        raise ValueError(f"{tag} points to a different commit in the release source")
     reserved = []
     for name in refs:
         if name.startswith("refs/tags/v") and not name.endswith("^{}") and name != ref:
             value = name.removeprefix("refs/tags/v")
             if SEMVER.fullmatch(value):
                 reserved.append(version(value))
+    return reserved
+
+
+def source_snapshot(operator, plan=False):
+    # GitHub receives these refs through the existing authenticated Forgejo push mirror.
+    # Hosted runners never connect to the private home network. Local plans read Forgejo.
+    source = (f"https://code.olsen.cloud/homelab/{operator}.git" if plan else
+              f"https://github.com/morten-olsen/homelab-{operator}.git")
+    output = command(["git", "ls-remote", source, "refs/heads/main", "refs/tags/v*"])
+    refs = dict(line.split()[::-1] for line in output.splitlines())
+    main = refs.get("refs/heads/main", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", main):
+        raise ValueError("Release source main is missing or invalid")
+    command(["git", "fetch", "--no-tags", source, "refs/heads/main"])
+    if command(["git", "rev-parse", "FETCH_HEAD"]) != main:
+        raise ValueError("Release source main changed during verification; retry the read-only check")
+    return refs
+
+
+def verify_source(operator, tag, commit, plan=False):
+    refs = source_snapshot(operator, plan)
+    reserved = check_source(refs, tag, commit, require_tag=not plan)
+    command(["git", "merge-base", "--is-ancestor", commit, refs["refs/heads/main"]])
     return reserved
 
 
@@ -116,12 +139,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--operator", choices=OPERATORS, required=True)
     parser.add_argument("--tag")
+    parser.add_argument("--check-source", action="store_true",
+                        help="Inspect read-only outbound mirror access; never publish")
     parser.add_argument("--commit", help="Full source commit SHA")
     parser.add_argument("--workflow-run", type=Path, help="Validate a completed workflow_run event file")
     parser.add_argument("--plan", action="store_true", help="Allow an absent source tag; never create it")
     parser.add_argument("--stage", choices=("image", "release", "pages"), default="image")
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args()
+    if args.check_source:
+        if args.tag or args.commit or args.workflow_run or args.plan or args.github_output or args.stage != "image":
+            raise ValueError("Source inspection cannot supply publication inputs or outputs")
+        refs = source_snapshot(args.operator)
+        print(f"Source inspection passed: {args.operator}; mirrored main={refs['refs/heads/main']}")
+        return
     if args.workflow_run:
         if args.tag or args.commit or args.plan or args.stage != "pages":
             raise ValueError("Workflow handoff is only for the Pages stage")
@@ -135,13 +166,7 @@ def main():
     candidate = version(args.tag[1:])
     if not re.fullmatch(r"[0-9a-f]{40}", args.commit):
         raise ValueError("Commit must be a full lowercase SHA")
-    source = f"https://code.olsen.cloud/homelab/{args.operator}.git"
-    output = command(["git", "ls-remote", source, "refs/heads/main", "refs/tags/v*"])
-    refs = dict(line.split()[::-1] for line in output.splitlines())
-    reserved = check_source(refs, args.tag, args.commit, require_tag=not args.plan)
-    # Fetch only authoritative main, not mirrored tags. The approved commit must belong to main.
-    command(["git", "fetch", "--no-tags", source, "refs/heads/main"])
-    command(["git", "merge-base", "--is-ancestor", args.commit, "FETCH_HEAD"])
+    reserved = verify_source(args.operator, args.tag, args.commit, args.plan)
     charts = published_versions(args.operator)
     check_version(candidate, reserved, charts)
     check_artifacts(args.operator, args.tag, args.stage)

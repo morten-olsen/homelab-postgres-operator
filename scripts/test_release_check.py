@@ -62,7 +62,8 @@ class ReleaseCheckTests(unittest.TestCase):
             for source_sha in [OTHER, SHA]:
                 with (
                     self.subTest(source_sha=source_sha), patch.object(sys, "argv", args),
-                    patch.object(release, "command", side_effect=[f"{source_sha}\trefs/tags/v0.0.21", "", ""]),
+                    patch.object(release, "source_snapshot", return_value={"refs/heads/main": SHA, "refs/tags/v0.0.21": source_sha}),
+                    patch.object(release, "command", return_value=""),
                     patch.object(release, "published_versions", return_value=[(0, 0, 20)]),
                     patch.object(release, "check_artifacts") as artifacts,
                     patch("builtins.print"),
@@ -78,7 +79,7 @@ class ReleaseCheckTests(unittest.TestCase):
                         self.assertIn(f"release_commit={SHA}\n", output.read_text())
 
     def test_missing_authoritative_tag_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "absent from Forgejo"):
+        with self.assertRaisesRegex(ValueError, "absent from the release source"):
             release.check_source({}, "v0.0.21", SHA, require_tag=True)
 
     def test_plan_accepts_an_unused_tag_without_creating_it(self):
@@ -177,7 +178,8 @@ class ReleaseCheckTests(unittest.TestCase):
         failure = subprocess.CalledProcessError(1, ["git", "merge-base"])
         with (
             patch.object(sys, "argv", args),
-            patch.object(release, "command", side_effect=[f"{SHA}\trefs/tags/v0.0.21", "", failure]),
+            patch.object(release, "source_snapshot", return_value={"refs/heads/main": SHA, "refs/tags/v0.0.21": SHA}),
+            patch.object(release, "command", side_effect=failure),
             patch.object(release, "check_artifacts") as artifacts,
         ):
             with self.assertRaises(subprocess.CalledProcessError):
@@ -193,7 +195,8 @@ class ReleaseCheckTests(unittest.TestCase):
                 with (
                     self.subTest(plan=plan, failure=failure),
                     patch.object(sys, "argv", args + (["--plan"] if plan else [])),
-                    patch.object(release, "command", side_effect=[f"{SHA}\trefs/tags/v0.0.21", "", ""]),
+                    patch.object(release, "source_snapshot", return_value={"refs/heads/main": SHA, "refs/tags/v0.0.21": SHA}),
+                    patch.object(release, "command", return_value=""),
                     patch.object(release, "published_versions", return_value=[(0, 0, 20)]),
                     patch.object(release, "check_artifacts", side_effect=ValueError("exists") if failure else None),
                     patch("builtins.print"),
