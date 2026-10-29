@@ -102,3 +102,8 @@ The `reclaimPolicy` field in the `PostgresDatabase` spec controls what happens w
 uses a `pgdata` child directory inside its PVC: UID 999 can create and own that
 directory without trying to chmod the root-owned mount point. A `pg_isready`
 readiness probe gates the connection and database reconciliation checks.
+
+## Release ownership
+
+See [Operator releases](docs/releases.md) for approved Forgejo tags, publication
+checks, version immutability and recovery. Main merges validate without publishing.
