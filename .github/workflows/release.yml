@@ -1,6 +1,6 @@
 name: Release
 
-# Main and branch pushes validate only. Publication requires an approved Forgejo tag.
+# Main and branch pushes validate only. Publication requires an approved tag pushed from Forgejo to the mirror.
 on:
   push:
     branches:
@@ -34,8 +34,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - run: python3 -m unittest discover -s scripts -p 'test_release_check.py' -v
+      - run: python3 -m unittest discover -s scripts -p 'test_release*.py' -v
+      - name: Inspect outbound mirror access
+        run: python3 scripts/release_check.py --operator postgres-operator --check-source
 
   version:
     name: Verify Forgejo Release
@@ -77,6 +80,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up QEMU
@@ -146,6 +150,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install Helm

@@ -1,7 +1,7 @@
 name: Publish Helm Repository
 
 # workflow_run uses the default-branch ref, preserving the main-only Pages environment.
-# Its payload is untrusted until the read-only job verifies Forgejo tag provenance.
+# Its payload is untrusted until the read-only job verifies the tag delivered by the Forgejo push mirror.
 on:
   workflow_run:
     workflows: [Release]
