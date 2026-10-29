@@ -42,7 +42,14 @@ source reservation and every published chart. Existing images or release
 metadata block partial-publication retries, even when the source tag is missing.
 Each publisher rechecks source/version and its own artifact immediately before
 writing, so retrying an individual failed job cannot bypass the original gate.
-Image → release assets → Pages run in order. The build cannot bypass a failed
+Image → release assets → Pages run in order. Pages follows a successful Release
+through `workflow_run` on the default branch: the existing `github-pages`
+environment allows main only. A separate read-only job runs the trusted main
+verifier, rejects foreign/PR/failed/malformed event metadata, and proves the
+authoritative tag/SHA, ancestry and prior artifacts before passing validated
+outputs to the Pages job. It never executes event-supplied code with publishing
+permissions before that check, downloads no workflow artifacts and adds no
+credential, environment policy or token scope. The build cannot bypass a failed
 gate on a tag event. Publications serialize;
 push one approved tag and wait before approving/pushing another. No new
 credential or permission is needed; source checks use public read endpoints.

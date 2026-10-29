@@ -1,3 +1,4 @@
+import copy
 import json
 import subprocess
 import sys
@@ -15,11 +16,66 @@ OTHER = "b" * 40
 
 
 class ReleaseCheckTests(unittest.TestCase):
+    def test_workflow_handoff_rejects_untrusted_or_non_release_events(self):
+        repository = "morten-olsen/homelab-postgres-operator"
+        event = {
+            "repository": {"full_name": repository},
+            "workflow_run": {
+                "head_repository": {"full_name": repository}, "event": "push",
+                "conclusion": "success", "path": ".github/workflows/release.yml",
+                "name": "Release", "head_branch": "v0.0.21", "head_sha": SHA,
+            },
+        }
+        self.assertEqual(release.workflow_release(event, "postgres-operator"), ("v0.0.21", SHA))
+        for field, value in [
+            ("head_repository", {"full_name": "attacker/fork"}),
+            ("event", "pull_request"), ("conclusion", "failure"),
+            ("path", ".github/workflows/other.yml"), ("name", "Tests"),
+            ("head_branch", "main"), ("head_branch", "v1.2.3\nINJECT=x"),
+            ("head_sha", "$(id)"),
+        ]:
+            untrusted = copy.deepcopy(event)
+            untrusted["workflow_run"][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                release.workflow_release(untrusted, "postgres-operator")
+
     def test_only_canonical_stable_versions(self):
         self.assertEqual(release.version("0.10.2"), (0, 10, 2))
         for value in ["01.2.3", "1.2", "1.2.3-rc.1", "1.2.3+build", "1.2.3\n", "$(id)"]:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 release.version(value)
+
+    def test_workflow_cli_validates_source_before_exporting_a_checkout_commit(self):
+        repository = "morten-olsen/homelab-postgres-operator"
+        with tempfile.TemporaryDirectory() as directory:
+            event_path, output = Path(directory) / "event.json", Path(directory) / "outputs"
+            event_path.write_text(json.dumps({
+                "repository": {"full_name": repository},
+                "workflow_run": {
+                    "head_repository": {"full_name": repository}, "event": "push",
+                    "conclusion": "success", "path": ".github/workflows/release.yml",
+                    "name": "Release", "head_branch": "v0.0.21", "head_sha": SHA,
+                },
+            }))
+            args = ["release_check.py", "--operator", "postgres-operator", "--workflow-run",
+                    str(event_path), "--stage", "pages", "--github-output", str(output)]
+            for source_sha in [OTHER, SHA]:
+                with (
+                    self.subTest(source_sha=source_sha), patch.object(sys, "argv", args),
+                    patch.object(release, "command", side_effect=[f"{source_sha}\trefs/tags/v0.0.21", "", ""]),
+                    patch.object(release, "published_versions", return_value=[(0, 0, 20)]),
+                    patch.object(release, "check_artifacts") as artifacts,
+                    patch("builtins.print"),
+                ):
+                    if source_sha != SHA:
+                        with self.assertRaisesRegex(ValueError, "different commit"):
+                            release.main()
+                        self.assertFalse(output.exists())
+                        artifacts.assert_not_called()
+                    else:
+                        release.main()
+                        artifacts.assert_called_once_with("postgres-operator", "v0.0.21", "pages")
+                        self.assertIn(f"release_commit={SHA}\n", output.read_text())
 
     def test_missing_authoritative_tag_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "absent from Forgejo"):
@@ -148,7 +204,7 @@ class ReleaseCheckTests(unittest.TestCase):
                         self.assertFalse(output.exists())
                     else:
                         release.main()
-                        self.assertEqual(output.read_text(), "new_tag=v0.0.21\nnew_version=0.0.21\n")
+                        self.assertEqual(output.read_text(), f"new_tag=v0.0.21\nnew_version=0.0.21\nrelease_commit={SHA}\n")
 
 
 class MirrorRegressionTests(unittest.TestCase):

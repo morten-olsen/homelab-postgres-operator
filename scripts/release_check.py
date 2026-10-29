@@ -96,15 +96,38 @@ def check_artifacts(operator, tag, stage="image"):
         raise ValueError("Prior release publication is missing")
 
 
+def workflow_release(event, operator):
+    """Treat workflow_run metadata as untrusted; source checks still follow."""
+    repository = f"morten-olsen/homelab-{operator}"
+    run = event["workflow_run"]
+    if (event["repository"]["full_name"] != repository
+            or run["head_repository"]["full_name"] != repository
+            or run["event"] != "push" or run["conclusion"] != "success"
+            or run["path"] != ".github/workflows/release.yml" or run["name"] != "Release"):
+        raise ValueError("Not a successful release push in this repository")
+    tag, commit = run["head_branch"], run["head_sha"]
+    if not tag.startswith("v") or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("Invalid release tag or commit in workflow handoff")
+    version(tag[1:])
+    return tag, commit
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--operator", choices=OPERATORS, required=True)
-    parser.add_argument("--tag", required=True)
-    parser.add_argument("--commit", required=True, help="Full source commit SHA")
+    parser.add_argument("--tag")
+    parser.add_argument("--commit", help="Full source commit SHA")
+    parser.add_argument("--workflow-run", type=Path, help="Validate a completed workflow_run event file")
     parser.add_argument("--plan", action="store_true", help="Allow an absent source tag; never create it")
     parser.add_argument("--stage", choices=("image", "release", "pages"), default="image")
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args()
+    if args.workflow_run:
+        if args.tag or args.commit or args.plan or args.stage != "pages":
+            raise ValueError("Workflow handoff is only for the Pages stage")
+        args.tag, args.commit = workflow_release(json.loads(args.workflow_run.read_text()), args.operator)
+    if not args.tag or not args.commit:
+        raise ValueError("Both tag and commit are required")
     if args.plan and (args.github_output or args.stage != "image"):
         raise ValueError("Plan mode cannot supply publication outputs or resume a publication stage")
     if not args.tag.startswith("v"):
@@ -125,7 +148,7 @@ def main():
     print(f"Preflight passed: {args.operator} {args.tag} at {args.commit}; plan={args.plan}")
     if args.github_output:
         with args.github_output.open("a") as output:
-            output.write(f"new_tag={args.tag}\nnew_version={args.tag[1:]}\n")
+            output.write(f"new_tag={args.tag}\nnew_version={args.tag[1:]}\nrelease_commit={args.commit}\n")
 
 
 if __name__ == "__main__":
