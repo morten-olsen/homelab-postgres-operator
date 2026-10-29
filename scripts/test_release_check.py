@@ -87,6 +87,35 @@ class ReleaseCheckTests(unittest.TestCase):
         with patch.object(release, "image_exists", return_value=False), patch.object(release, "exists", return_value=False):
             release.check_artifacts("postgres-operator", "v0.0.21")
 
+    def test_individual_job_retries_cannot_overwrite_published_artifacts(self):
+        for stage in ["image", "release"]:
+            with (
+                self.subTest(stage=stage),
+                patch.object(release, "image_exists", return_value=True),
+                patch.object(release, "exists", return_value=True),
+            ):
+                with self.assertRaisesRegex(ValueError, "already exists"):
+                    release.check_artifacts("postgres-operator", "v0.0.21", stage)
+
+    def test_release_and_pages_require_the_prior_publication_stage(self):
+        for stage, image, metadata in [("release", False, False), ("pages", True, False)]:
+            with (
+                self.subTest(stage=stage),
+                patch.object(release, "image_exists", return_value=image),
+                patch.object(release, "exists", return_value=metadata),
+            ):
+                with self.assertRaisesRegex(ValueError, "missing"):
+                    release.check_artifacts("postgres-operator", "v0.0.21", stage)
+
+    def test_normal_stage_handoffs_allow_only_previously_completed_artifacts(self):
+        for stage, metadata in [("release", False), ("pages", True)]:
+            with (
+                self.subTest(stage=stage),
+                patch.object(release, "image_exists", return_value=True),
+                patch.object(release, "exists", return_value=metadata),
+            ):
+                release.check_artifacts("postgres-operator", "v0.0.21", stage)
+
     def test_cli_cannot_publish_a_commit_outside_source_main(self):
         args = ["release_check.py", "--operator", "postgres-operator", "--tag", "v0.0.21", "--commit", SHA]
         failure = subprocess.CalledProcessError(1, ["git", "merge-base"])

@@ -40,7 +40,10 @@ The publication gate requires the canonical tag in Forgejo at the exact event
 commit, that commit on authoritative main, and a version newer than every other
 source reservation and every published chart. Existing images or release
 metadata block partial-publication retries, even when the source tag is missing.
-The build cannot bypass a failed gate on a tag event. Publications serialize;
+Each publisher rechecks source/version and its own artifact immediately before
+writing, so retrying an individual failed job cannot bypass the original gate.
+Image → release assets → Pages run in order. The build cannot bypass a failed
+gate on a tag event. Publications serialize;
 push one approved tag and wait before approving/pushing another. No new
 credential or permission is needed; source checks use public read endpoints.
 

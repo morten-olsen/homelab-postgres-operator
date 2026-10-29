@@ -107,6 +107,21 @@ jobs:
             type=sha
             type=raw,value=${{ needs.version.outputs.new_version }},enable=${{ needs.version.outputs.new_version != '' }}
 
+      - name: Install Helm for publication recheck
+        if: github.event_name != 'pull_request'
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Recheck immediately before image publication
+        if: github.event_name != 'pull_request'
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.new_tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: >-
+          python3 scripts/release_check.py --operator postgres-operator
+          --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --stage image
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -155,6 +170,14 @@ jobs:
           sed -i "s/^appVersion:.*/appVersion: \"${{ needs.version.outputs.new_version }}\"/" charts/postgres-operator/Chart.yaml
           helm package charts/postgres-operator
 
+      - name: Recheck immediately before release publication
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.new_tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: >-
+          python3 scripts/release_check.py --operator postgres-operator
+          --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --stage release
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -170,7 +193,7 @@ jobs:
   update-helm-repo:
     name: Update Helm Repository
     runs-on: ubuntu-latest
-    needs: [version, build-and-push]
+    needs: [version, build-and-push, create-release]
     if: needs.version.result == 'success' && needs.version.outputs.new_tag != ''
     permissions:
       contents: read
@@ -301,6 +324,14 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: _site
+
+      - name: Recheck immediately before pages publication
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.new_tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: >-
+          python3 scripts/release_check.py --operator postgres-operator
+          --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --stage pages
 
       - name: Deploy to GitHub Pages
         id: deployment

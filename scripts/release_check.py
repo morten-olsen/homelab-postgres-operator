@@ -83,11 +83,17 @@ def image_exists(operator, value):
     })
 
 
-def check_artifacts(operator, tag):
-    if image_exists(operator, tag[1:]):
+def check_artifacts(operator, tag, stage="image"):
+    image = image_exists(operator, tag[1:])
+    if stage == "image" and image:
         raise ValueError("Image version already exists; partial publication requires an explicit recovery decision")
-    if exists(f"https://api.github.com/repos/morten-olsen/homelab-{operator}/releases/tags/{tag}"):
+    if stage != "image" and not image:
+        raise ValueError("Prior image publication is missing")
+    metadata = exists(f"https://api.github.com/repos/morten-olsen/homelab-{operator}/releases/tags/{tag}")
+    if stage != "pages" and metadata:
         raise ValueError("Release already exists; do not overwrite it")
+    if stage == "pages" and not metadata:
+        raise ValueError("Prior release publication is missing")
 
 
 def main():
@@ -96,8 +102,11 @@ def main():
     parser.add_argument("--tag", required=True)
     parser.add_argument("--commit", required=True, help="Full source commit SHA")
     parser.add_argument("--plan", action="store_true", help="Allow an absent source tag; never create it")
+    parser.add_argument("--stage", choices=("image", "release", "pages"), default="image")
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args()
+    if args.plan and (args.github_output or args.stage != "image"):
+        raise ValueError("Plan mode cannot supply publication outputs or resume a publication stage")
     if not args.tag.startswith("v"):
         raise ValueError("Release tag must start with v")
     candidate = version(args.tag[1:])
@@ -112,11 +121,9 @@ def main():
     command(["git", "merge-base", "--is-ancestor", args.commit, "FETCH_HEAD"])
     charts = published_versions(args.operator)
     check_version(candidate, reserved, charts)
-    check_artifacts(args.operator, args.tag)
+    check_artifacts(args.operator, args.tag, args.stage)
     print(f"Preflight passed: {args.operator} {args.tag} at {args.commit}; plan={args.plan}")
     if args.github_output:
-        if args.plan:
-            raise ValueError("Plan mode cannot supply publication outputs")
         with args.github_output.open("a") as output:
             output.write(f"new_tag={args.tag}\nnew_version={args.tag[1:]}\n")
 
