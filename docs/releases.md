@@ -60,7 +60,13 @@ Git URL. Mirror failures are repaired in Forgejo, never with downstream refs.
 A consumed version is refused even when its tag is missing. Existing images
 and release metadata block partial-publication retries. Each publisher repeats
 its source/version/artifact checks immediately before writing, including
-individual job retries. Lookup errors fail closed. All checkouts performing
+individual job retries. Lookup errors fail closed. Prior-stage image/release visibility is confirmed
+with up to six read-only lookups over 57 seconds when the response is 404;
+permission, rate-limit and transport errors fail immediately. Existing artifacts
+are refused without retry. This never retries an image/release/Pages publisher.
+Artifact lookups request cache revalidation. Install generation uses the existing
+Makefile-pinned Kustomize target instead of its anonymous latest-release API.
+All checkouts performing
 ancestry checks fetch full history. Image, release assets and Pages run in
 order; push one approved tag and wait for the complete publication.
 
